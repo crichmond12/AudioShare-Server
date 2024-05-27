@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+curve25519-dalek = "4.1.2"
+data-encoding = "2.6.0"
+local-ip-address = "0.6.1"
+#mdns = "3.0.0"
+mdns-sd = "0.11.1"
+ring = "0.17.8"
+rusqlite = {version = "0.31.0", features = ["bundled"]}
+tokio = {version =  "1.37.0", features = ["full"]}
+#zeroconf = "0.14.1"
