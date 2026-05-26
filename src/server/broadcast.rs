@@ -1,11 +1,8 @@
-use std::sync::Arc;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use local_ip_address::local_ip;
 use std::fs::File;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead};
 use std::path::Path;
-use std::net::{TcpListener, TcpStream};
-use std::thread;
 use tokio::time::{interval, Duration};
 
 pub struct Broadcast {
@@ -34,27 +31,29 @@ impl Broadcast {
         }
     }
 
-    pub async fn startBroadcast(&self) {
-        let interval_seconds = 30;
-        let mut interval = interval(Duration::from_secs(interval_seconds));
+    pub async fn start_broadcast(&self) {
+        let mdns = match self.register_service() {
+            Ok(mdns) => mdns,
+            Err(err) => {
+                eprintln!("Failed to register mDNS service: {}", err);
+                return;
+            }
+        };
+
+        let mut interval = interval(Duration::from_secs(60 * 60));
 
         loop {
-            // Wait for the interval to elapse
             interval.tick().await;
-
-            // Perform the broadcasting logic
-            self.broadcast().await;
+            let _ = &mdns;
         }
     }
 
-    async fn broadcast(&self) {
-        let mdns = ServiceDaemon::new().expect("Failed to create daemon");
-
-        // Create a service info.
+    fn register_service(&self) -> Result<ServiceDaemon, Box<dyn std::error::Error + Send + Sync>> {
+        let mdns = ServiceDaemon::new()?;
         let service_type = "_audioshare._tcp.local.";
         let instance_name = "AudioShare Device";
         let host_name = self.ip.clone() + ".local.";
-        let port = 1100;
+        let port = self.server_port as u16;
         let properties = [("serial_number", self.serial_number.to_string())];
 
         let my_service = ServiceInfo::new(
@@ -64,15 +63,11 @@ impl Broadcast {
             self.ip.to_string(),
             port,
             &properties[..],
-        ).unwrap();
+        )?;
 
-        // Register with the daemon, which publishes the service.
-        mdns.register(my_service).expect("Failed to register our service");
-
-        // Gracefully shutdown the daemon
-        std::thread::sleep(std::time::Duration::from_secs(10));
-        mdns.shutdown().unwrap();
-        }
+        mdns.register(my_service)?;
+        Ok(mdns)
+    }
 
     fn get_serial_number() -> io::Result<String> {
         let path = Path::new("/proc/cpuinfo");

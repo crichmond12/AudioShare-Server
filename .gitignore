@@ -1,1 +1,65 @@
-/target
+# ── Rust ────────────────────────────────────────────────────────────────────
+/target/
+
+# ── Secrets & credentials ────────────────────────────────────────────────────
+.env
+.env.*
+.env.local
+.ssh/
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+# SSH private-key file checked out by accident (named after a host)
+crichmond@*
+
+# ── Databases ────────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── SQLite static-build artifacts ────────────────────────────────────────────
+# (generated when building a bundled/static SQLite for cross-compilation)
+/bin/
+/lib/
+/include/
+/share/
+
+# ── Go (site/ sub-project) ───────────────────────────────────────────────────
+# site/ has its own .git — treat as a separate repo, not tracked here
+site/
+# If you ever remove site/.git and fold it in, ignore its compiled binaries:
+site/audioshare
+site/main
+site/migrate
+
+# ── Large downloads / vendored binaries ──────────────────────────────────────
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.zip
+go*.linux-*.tar.gz
+
+# ── iOS / Spotify SDK ────────────────────────────────────────────────────────
+# Large pre-built binary framework — pull from Spotify's releases instead
+ios-sdk-*/
+
+# ── Build & compiler output ──────────────────────────────────────────────────
+output.txt
+*.log
+
+# ── Vim ──────────────────────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+src/vim
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
