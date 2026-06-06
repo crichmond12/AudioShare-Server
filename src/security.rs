@@ -14,13 +14,15 @@ use base64::engine::general_purpose;
 pub struct Security {
     session: Session,
     client_public_key: PublicKey,
+    pairing_secret: [u8; 32],
 }
 
 impl Security {
-    pub fn new(client_public_key: PublicKey) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(client_public_key: PublicKey, pairing_secret: [u8; 32]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
             session: Session::new(client_public_key),
             client_public_key,
+            pairing_secret,
         })
     }
 
@@ -51,8 +53,10 @@ impl Security {
         // Derive shared secret
         let shared_secret = server_private_key.diffie_hellman(&self.client_public_key);
 
-        // Use HKDF to derive an encryption key from the shared secret
-        let hk = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
+        // Use HKDF to derive an encryption key from the shared secret.
+        // The pairing secret is used as the salt — it is only known to devices
+        // that have physically scanned the QR code, preventing MITM attacks.
+        let hk = Hkdf::<Sha256>::new(Some(&self.pairing_secret), shared_secret.as_bytes());
         let mut encryption_key = [0u8; 32];
         hk.expand(&[], &mut encryption_key).expect("HKDF expand failed");
 

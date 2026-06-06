@@ -7,6 +7,7 @@ use std::io::{self, BufRead};
 use std::path::Path;
 use super::connection::Connection;
 use crate::security::Security;
+use crate::pairing;
 
 enum ConnectionActions {
     StartConnection(serde_json::Value),
@@ -17,24 +18,33 @@ pub struct ConnectServer {
     pub serial_number: String,
     pub ip: String,
     pub server_port: i32,
+    pub pairing_secret: [u8; 32],
 }
 
 impl ConnectServer {
     pub fn new() -> Self {
         let my_ip_address = local_ip().unwrap().to_string();
+
+        let pairing_secret = pairing::load_or_create(Path::new(pairing::PAIRING_SECRET_PATH))
+            .expect("Failed to load or create pairing secret — cannot start securely");
+
         match Self::get_serial_number() {
             Ok(serial_number) => {
+                let qr = pairing::qr_payload(&serial_number, &pairing_secret);
+                println!("=== SCAN THIS QR CODE TO PAIR ===");
+                println!("{}", qr);
+                println!("=================================");
                 Self {
-                    serial_number: serial_number,
+                    serial_number,
                     ip: my_ip_address,
                     server_port: 50505,
+                    pairing_secret,
                 }
             }
-            Err(_) => Self {
-                serial_number: "null".to_string(),
-                ip: "null".to_string(),
-                server_port: 0,
-            },
+            Err(e) => {
+                eprintln!("Fatal: could not read serial number: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -55,7 +65,8 @@ impl ConnectServer {
                                 match Security::get_public_key_from_request(json) {
                                     Ok(public_key) => {
                                         println!("Got public");
-                                        let security = Security::new(public_key)
+                                        let pairing_secret = server.pairing_secret; // [u8;32] is Copy
+                                        let security = Security::new(public_key, pairing_secret)
                                             .expect("Error creating new security module.");
                                         let mut connection = Connection::new(security, &mut stream);
                                         println!("Start New CONNECTION!!!");

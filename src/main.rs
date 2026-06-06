@@ -9,6 +9,7 @@ mod secure_error;
 mod security;
 mod mdb;
 mod json_structs;
+mod pairing;
 //mod connection;
 use std::sync::Arc;
 /*mod server;
