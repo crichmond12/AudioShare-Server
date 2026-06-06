@@ -60,7 +60,7 @@ A self-hosted Rust server that enables secure, encrypted audio sharing over a lo
 1. Server broadcasts via mDNS on the local network
 2. iOS client discovers the service and initiates a TCP connection
 3. Client sends its X25519 public key
-4. Server performs ECDH, derives a shared session key via HKDF
+4. Server performs ECDH, derives a shared session key via HKDF using the pairing secret as the salt
 5. All subsequent communication is encrypted with AES-256-GCM
 
 ---
@@ -143,6 +143,7 @@ audio_share/
 │   │   ├── server.rs        # Warp HTTP routes
 │   │   └── spotify_routes.rs # Spotify OAuth token swap
 │   ├── security.rs          # X25519 / HKDF / AES-GCM helpers
+│   ├── pairing.rs           # Pairing secret load/create and QR payload generation
 │   ├── session.rs           # Session key & lifetime tracking
 │   ├── mdb.rs               # SQLite access layer
 │   ├── json_structs/        # Request/response types
@@ -160,9 +161,10 @@ audio_share/
 All client-server communication is encrypted end-to-end:
 
 - **Key exchange:** X25519 Elliptic Curve Diffie-Hellman (ephemeral keys per session)
-- **Key derivation:** HKDF with SHA-256
+- **Key derivation:** HKDF with SHA-256, salted with a persistent 32-byte pairing secret — prevents MITM attacks by ensuring only a device that physically scanned the QR code can derive the session key
 - **Symmetric encryption:** AES-256-GCM (authenticated encryption)
 - **Session isolation:** Each client gets a unique UUID-keyed session with its own derived key
+- **Pairing secret:** Generated once on first run, stored at `/etc/audio_share/pairing_secret.b64`, and embedded in the QR code displayed at startup
 
 ---
 
