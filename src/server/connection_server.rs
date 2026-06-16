@@ -2,8 +2,11 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use local_ip_address::local_ip;
+#[cfg(target_os = "linux")]
 use std::fs::File;
-use std::io::{self, BufRead};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::BufRead;
 use std::path::Path;
 use super::connection::Connection;
 use crate::security::Security;
@@ -31,9 +34,7 @@ impl ConnectServer {
         match Self::get_serial_number() {
             Ok(serial_number) => {
                 let qr = pairing::qr_payload(&serial_number, &pairing_secret);
-                println!("=== SCAN THIS QR CODE TO PAIR ===");
-                println!("{}", qr);
-                println!("=================================");
+                pairing::present_qr(&qr);
                 Self {
                     serial_number,
                     ip: my_ip_address,
@@ -127,6 +128,12 @@ impl ConnectServer {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn get_serial_number() -> io::Result<String> {
+        Ok("dev-mac-serial".to_string())
+    }
+
+    #[cfg(target_os = "linux")]
     fn get_serial_number() -> io::Result<String> {
         let path = Path::new("/proc/cpuinfo");
         let file = File::open(&path)?;

@@ -1,7 +1,11 @@
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use local_ip_address::local_ip;
+#[cfg(target_os = "linux")]
 use std::fs::File;
-use std::io::{self, BufRead};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::BufRead;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use tokio::time::{interval, Duration};
 
@@ -69,6 +73,12 @@ impl Broadcast {
         Ok(mdns)
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn get_serial_number() -> io::Result<String> {
+        Ok("dev-mac-serial".to_string())
+    }
+
+    #[cfg(target_os = "linux")]
     fn get_serial_number() -> io::Result<String> {
         let path = Path::new("/proc/cpuinfo");
         let file = File::open(&path)?;

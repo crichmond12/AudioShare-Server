@@ -6,14 +6,18 @@ edition = "2021"
 [dependencies]
 aes-gcm = "0.10.3"
 base64 = "0.22.1"
+# Cross-platform audio output: CoreAudio on macOS (dev), ALSA on the Pi.
+cpal = "0.15"
 curve25519-dalek = "4.1.2"
 data-encoding = "2.6.0"
 env_logger = "0.11.3"
 hkdf = "0.12.4"
+image = { version = "=0.25.1", default-features = false, features = ["png"] }
 lazy_static = "1.4.0"
 local-ip-address = "0.6.1"
 #mdns = "3.0.0"
 mdns-sd = "0.11.1"
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
 rand = "0.8.5"
 rand_core = "0.6.4"
 reqwest = {version = "0.12.8", features = ["json", "rustls-tls"]}

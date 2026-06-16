@@ -77,21 +77,27 @@ impl Security {
         Ok(encrypted_message)
     }
 
-    #[allow(dead_code)]
-    pub fn encrypt_data(&self, data: String) -> String {
+    pub fn encrypt_data(&self, data: String) -> Result<String, &'static str> {
         // Create AES-GCM cipher instance
         let session_key = self.session.get_session_key_slice();
         let key = Key::<Aes256Gcm>::from_slice(session_key);
         let cipher = Aes256Gcm::new(key);
 
         // Generate a random nonce
-        let nonce: [u8; 12] = rand::thread_rng().gen();
-        let nonce = Nonce::from_slice(&nonce); // 96-bits; unique per message
+        let nonce_bytes: [u8; 12] = rand::thread_rng().gen();
+        let nonce = Nonce::from_slice(&nonce_bytes); // 96-bits; unique per message
 
         // Encrypt the plaintext
-        let _ciphertext = cipher.encrypt(nonce, data.as_bytes());
-        let return_val = "work";
-        return_val.to_string()
+        let ciphertext = cipher
+            .encrypt(nonce, data.as_bytes())
+            .map_err(|_| "Encryption failed")?;
+
+        // Combine nonce and ciphertext into one buffer, then base64-encode it.
+        // This mirrors the layout decrypt_data expects: nonce(12) ‖ ciphertext.
+        let mut combined = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+        Ok(general_purpose::STANDARD.encode(combined))
     }
 
     pub fn decrypt_data(&self, data: String) -> Result<String, &'static str> {
@@ -120,5 +126,39 @@ impl Security {
         let decrypted_string =
             String::from_utf8(decrypted_data).map_err(|_| "UTF-8 conversion failed")?;
         Ok(decrypted_string)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use x25519_dalek::EphemeralSecret;
+
+    fn test_security() -> Security {
+        let client_public_key = PublicKey::from(&EphemeralSecret::random_from_rng(OsRng));
+        Security::new(client_public_key, [7u8; 32]).expect("failed to build Security")
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_round_trips() {
+        let security = test_security();
+        let plaintext = "{\"status\":\"ok\",\"task\":\"play\"}".to_string();
+
+        let encrypted = security
+            .encrypt_data(plaintext.clone())
+            .expect("encryption failed");
+        // Output must be base64 of nonce(12) ‖ ciphertext, decryptable by decrypt_data.
+        assert_ne!(encrypted, plaintext);
+        let decrypted = security.decrypt_data(encrypted).expect("decryption failed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn each_encryption_uses_a_fresh_nonce() {
+        let security = test_security();
+        let a = security.encrypt_data("same".to_string()).unwrap();
+        let b = security.encrypt_data("same".to_string()).unwrap();
+        // Random nonce per message => identical plaintext yields different ciphertext.
+        assert_ne!(a, b);
     }
 }

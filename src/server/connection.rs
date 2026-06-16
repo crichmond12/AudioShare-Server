@@ -1,7 +1,9 @@
 use crate::json_structs::json_trait::JsonSerializable;
 use crate::json_structs::response_data::SessionKeyResponseData;
 use crate::json_structs::server_response::ServerResponseData;
+use crate::json_structs::task_response::TaskResponse;
 use crate::security::Security;
+use crate::server::commands;
 use crate::server::server::MAIN_SERVER;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -95,12 +97,38 @@ impl<'connection> Connection<'connection> {
                         return Ok(true);
                     }
 
-                    println!("Authenticated request received: {}", parsed_data);
+                    if let Err(e) = self.handle_task(&parsed_data).await {
+                        println!("Error responding to task: {}", e);
+                        return Ok(true);
+                    }
                 }
                 Ok(Err(_)) => return Ok(true),
                 Err(_) => return Ok(true),
             }
         }
+    }
+
+    /// Parse the `task` field of an authenticated message, dispatch it, and
+    /// send the (encrypted) response back. Unknown tasks get a structured error
+    /// response but do not drop the connection — only a transport failure does.
+    async fn handle_task(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let response = match request["task"].as_str() {
+            Some(task_str) => {
+                let task = commands::Task::parse(task_str);
+                commands::dispatch(task, &request["data"])
+            }
+            None => {
+                println!("Authenticated request missing `task` field: {}", request);
+                TaskResponse::error("", "missing_task")
+            }
+        };
+
+        let encrypted = self.security.encrypt_data(response.to_json())?;
+        self.stream.write_all(encrypted.as_bytes()).await?;
+        Ok(())
     }
 
     async fn authenticate_message(&self, request: &serde_json::Value) -> bool {

@@ -1,6 +1,7 @@
 //mod authentication;
 //mod mdb;
 //use std::sync::Arc;
+mod audio;
 mod server;
 mod errors;
 mod rest_server;
