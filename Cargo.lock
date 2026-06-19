@@ -166,6 +166,7 @@ name = "audio_share"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "audioshare_protocol",
  "base64 0.22.1",
  "cpal",
  "curve25519-dalek",
@@ -193,6 +194,14 @@ dependencies = [
  "uuid",
  "warp",
  "x25519-dalek",
+]
+
+[[package]]
+name = "audioshare_protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

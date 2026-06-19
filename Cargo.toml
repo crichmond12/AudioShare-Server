@@ -3,8 +3,16 @@ name = "audio_share"
 version = "0.1.0"
 edition = "2021"
 
+# The hub is the workspace root package; the dongle agent (Change 5 sub-step 2.3)
+# joins as `crates/dongle_agent` later. Both share wire types via `crates/protocol`
+# so the hub<->dongle contract can't drift the way the iOS protocol does.
+[workspace]
+members = ["crates/protocol"]
+
 [dependencies]
 aes-gcm = "0.10.3"
+# Shared hub<->dongle control/registration wire types (Change 5 sub-step 2).
+audioshare_protocol = { path = "crates/protocol" }
 base64 = "0.22.1"
 # Cross-platform audio output: CoreAudio on macOS (dev), ALSA on the Pi.
 cpal = "0.15"
