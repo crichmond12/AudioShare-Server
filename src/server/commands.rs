@@ -1,3 +1,4 @@
+use crate::audio::player::PLAYER;
 use crate::json_structs::task_response::TaskResponse;
 use serde_json::{json, Value};
 
@@ -41,16 +42,38 @@ impl Task {
 
 /// Route a parsed task to its handler and produce the response to send back.
 ///
-/// The audio engine does not exist yet (KAN-18/20/21), so every recognized
-/// command is acknowledged with a `not_yet_implemented` note rather than
-/// actually producing audio. KAN-20 will replace these stubs with calls into
-/// the real playback engine. `_data` is the command payload, unused for now.
-pub fn dispatch(task: Task, _data: &Value) -> TaskResponse {
+/// `play` and `stop` drive the real playback engine ([`PLAYER`]); the remaining
+/// recognized tasks (`pause`/`seek`/`volume`) are still acknowledged with a
+/// `not_yet_implemented` note. `data` is the command payload (e.g. `play`'s
+/// stream URL).
+pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
     match task {
+        Task::Play => match data["url"].as_str() {
+            Some(url) if !url.is_empty() => match PLAYER.play(url) {
+                Ok(()) => {
+                    println!("Playing: {}", url);
+                    TaskResponse::accepted("play", None)
+                }
+                Err(e) => {
+                    println!("Playback failed for {}: {}", url, e);
+                    TaskResponse::error("play", "playback_failed")
+                }
+            },
+            _ => {
+                println!("Rejected play task: missing `data.url`");
+                TaskResponse::error("play", "missing_url")
+            }
+        },
+        Task::Stop => {
+            PLAYER.stop();
+            println!("Stopped playback");
+            TaskResponse::accepted("stop", None)
+        }
         Task::Unknown(ref name) => {
             println!("Rejected unsupported task: {}", name);
             TaskResponse::error(task.name(), "unsupported_task")
         }
+        // Pause/seek/volume are recognized but not implemented yet.
         ref known => {
             println!("Accepted task (stub): {}", known.name());
             TaskResponse::accepted(
@@ -76,11 +99,31 @@ mod tests {
         );
     }
 
+    // Note: the `play` success path is exercised by the manual end-to-end test,
+    // not here — it opens an audio device and hits the network, which a unit test
+    // can't do deterministically. We test only the device-free routing below.
+
     #[test]
-    fn known_task_dispatches_to_ok() {
-        let json = dispatch(Task::Play, &Value::Null).to_json();
+    fn stop_dispatches_to_ok() {
+        // `stop` with nothing playing is a no-op and needs no audio device.
+        let json = dispatch(Task::Stop, &Value::Null).to_json();
         assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"task\":\"stop\""));
+    }
+
+    #[test]
+    fn play_without_url_errors_missing_url() {
+        let json = dispatch(Task::Play, &Value::Null).to_json();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"missing_url\""));
         assert!(json.contains("\"task\":\"play\""));
+    }
+
+    #[test]
+    fn recognized_but_unimplemented_task_is_ok_stub() {
+        let json = dispatch(Task::Pause, &Value::Null).to_json();
+        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("not_yet_implemented"));
     }
 
     #[test]

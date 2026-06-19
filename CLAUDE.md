@@ -8,13 +8,32 @@ The iOS client lives at `~/Documents/Audio Share/` (Swift/SwiftUI). This repo is
 
 ## Product Vision & Roadmap
 
-**What Audio Share is:** small network devices (this server, on a Raspberry Pi) that plug into ordinary (non-smart) speakers and make them wireless. A user picks music on their phone and plays it to any speaker on the network. This server is the device that actually drives the speaker.
+**What Audio Share is:** open, self-hostable software that turns any ordinary (non-smart) speaker or amp into a networked, multi-room audio endpoint. It runs on a Raspberry Pi (or similar Linux device) that the user flashes/installs themselves. A user picks audio on their phone and plays it to any speaker on the network. This Rust service is the device that actually drives the speaker.
 
-**Core differentiator — independent multi-room:** the user can send *different* music to *different* speakers at the same time, each stream potentially from a *different* platform. So the server must support per-output (per-zone) playback: a device/output registry, zone grouping, and routing an independent stream to each output. Grouping outputs for *synchronized* playback of the same song (Sonos-style) is also a goal and is the harder case — it needs clock sync / latency alignment across outputs.
+**Distribution & goals (pivot, 2026-06):** Audio Share is being built as (1) **downloadable software** a user installs on their own hardware — the Volumio / moOde / Home Assistant model, *not* a hardware product we manufacture — and (2) a **portfolio/showcase project**. These goals reinforce each other: open-source core, a build that actually runs and demos end-to-end, polished setup UX, clean docs. There is no FCC/CE/inventory/hardware-margin path; the value is the software and the experience.
 
-**Streaming platforms (planned):** Spotify first, then Apple Music, YouTube Music, Pandora. Licensing differs per platform (Spotify/Apple Music generally forbid raw-audio capture). The design uses a **per-source play-mode**: some sources play *server-side* here (the server fetches/streams and outputs audio — e.g. a librespot/Spotify-Connect path), others *relay* from the phone (the phone sends encoded bytes that the server buffers and outputs — for local/web audio).
+**Strategic pivot — from streaming aggregator to open endpoint/receiver.** The original vision (the device fetches and streams Spotify/Apple Music/Pandora/YouTube *server-side*) is **not viable** for an indie/self-hosted product: those services forbid raw-audio capture, DRM (Widevine/EME) only decrypts at the player in real time, and Spotify's device program (eSDK) is approved-organizations-only and contractually forbids combining its content with other services. So we **stop trying to *be* a streaming service** and instead **become an endpoint that other apps play *to***, plus a player for open/DRM-free sources. This sidesteps licensing entirely — legally we are a speaker.
 
-**Current state (as of 2026-06):** the networking + security foundation is solid — TCP server, the two-phase X25519/HKDF/AES-GCM handshake, sessions, mDNS, and Go-side accounts/Spotify OAuth. But there is **no audio output at all** (no audio libraries imported), the connection loop authenticates messages then **drops the `task` field without dispatching it**, and there is no multi-output/zone concept, no streaming-source playback, and no tests. Dead code exists (`rest_server/`, `mdb.rs`, `authentication.rs`, `user.rs`). These gaps are tracked as epics/tasks in Jira project **KAN**. Treat message dispatch, server-side audio output, and per-zone routing as the central near-term work.
+**Two ways audio reaches a speaker:**
+- **Sources the device plays itself (DRM-free, we hold the encoded bytes):** internet radio, podcasts (RSS), self-hosted libraries (Subsonic/Navidrome, Jellyfin, Plex), and local/phone-relayed files. These are the legal core and ship first.
+- **Receiver protocols (the phone's existing app streams to us):** AirPlay 2 (via `shairport-sync`), optionally Spotify Connect (via `librespot`) and Chromecast. The user authenticates Spotify/Apple Music on their *own* phone and pushes to the device — no licensing exposure for us. Gray-area integrations like `librespot` ship as **optional, user-installed plugins**, never bundled, so responsibility sits with the user (the Volumio/moOde model).
+
+**Core differentiator — multi-room:** send *different* audio to *different* speakers at once (independent per-zone playback: an output registry, zone grouping, independent routing per output), and group outputs for *synchronized* playback of the same source. We **adopt Snapcast for synchronized multi-room** rather than building clock sync from scratch. Note that Sonos/WiiM already do both; our real differentiation is setup simplicity and being open/self-hostable.
+
+**Per-source play-mode** still organizes the engine: `server-side fetch+buffer` (we hold encoded bytes), `relay-from-phone` (phone sends local-audio bytes), `receiver` (an external protocol delivers audio to us), and a last-resort `loopback capture` (single-zone, ToS-gray, optional) for API-less platforms.
+
+**Current state (as of 2026-06):** networking + security foundation is solid — TCP server, the two-phase X25519/HKDF/AES-GCM handshake, sessions, mDNS. **Phase 1 (first end-to-end audio path) is done:** a `play` task with a stream URL now drives a real engine (`audio/player.rs` + `audio/decode.rs`) that fetches a DRM-free HTTP internet-radio stream, decodes (Symphonia, mp3/aac), resamples (Rubato), and plays it through the `audio/output.rs` cpal sink; `stop` halts it. Still single-zone with no multi-output/zone concept (phase 2) and minimal buffering (KAN-23). Dead code exists (`rest_server/`, `mdb.rs`, `authentication.rs`, `user.rs`). The Go service currently does accounts + Spotify OAuth — under the pivot, server-side Spotify OAuth is no longer needed and the account model itself may become optional (pairing is the security boundary); revisit before investing further there. These gaps are tracked in Jira project **KAN**, which will be reconciled with the pivot later.
+
+### Build plan (ordered)
+
+Sequenced as vertical slices — each phase ends at something demoable. Jira (project **KAN**) will be reconciled with this plan later; the phase numbers below are not ticket IDs.
+
+1. **First end-to-end audio path.** Wire `commands::dispatch()` into a real playback engine; finish the `AudioOutput` drain; add a decode step; play **internet radio** (HTTP stream → decode → cpal). Goal: phone says "play `<url>`", speaker makes sound. Proves the whole pipeline and is the gate for everything else (and for any demo video).
+2. **Independent multi-room.** Per-output/zone registry + routing so each output plays its own independent stream. This is the headline feature.
+3. **Synchronized multi-room via Snapcast.** Integrate/supervise Snapcast for grouped, time-aligned playback instead of a hand-rolled clock.
+4. **Receiver protocols.** AirPlay 2 receive (`shairport-sync`) so any iPhone app can push audio with zero licensing exposure; Spotify Connect (`librespot`) as an optional plugin.
+5. **More DRM-free sources.** Podcasts (RSS), Subsonic/Jellyfin client, phone-relayed local files.
+6. **Product & portfolio polish.** Flashable image / one-command installer, zero-config onboarding, jitter/underrun buffering, reconnect resilience, tests; open-source hygiene (README, architecture diagram, demo video, license). Optional monetization: pre-flashed images / pro tier / donations.
 
 ## Two Services
 
@@ -70,7 +89,9 @@ python3 migrations/migrate.py
 - `server/connection_server.rs` — TCP listener, handshake initiation, serial number read
 - `server/broadcast.rs` — mDNS registration as `_audioshare._tcp.local.` on port 50505
 - `server/connection.rs` — per-client loop; validates `session_token` UUID on every message
-- `server/commands.rs` — parses the `task` field into `Task` and dispatches it (currently stubs; KAN-20 wires the engine)
+- `server/commands.rs` — parses the `task` field into `Task` and dispatches it; `play`/`stop` drive the playback engine, the rest are stubs
+- `audio/player.rs` — `Player` + global `PLAYER`: owns the `AudioOutput` and the single in-flight decode thread; `play(url)`/`stop()`
+- `audio/decode.rs` — decode thread body: HTTP stream → Symphonia decode → Rubato resample/mix → `AudioOutput::write`
 - `security.rs` — all cryptography (X25519, HKDF, AES-256-GCM)
 - `session.rs` — holds the symmetric session key and `last_activity` timestamp
 - `pairing.rs` — loads/creates `/etc/audio_share/pairing_secret.b64`; generates QR payload
@@ -137,10 +158,12 @@ Generated by `pairing::qr_payload()`. iOS decodes this in `DeviceConnect` and st
 ```
 Entire JSON is encrypted with the session key and base64-encoded. Server decrypts via `Security::decrypt_data()`, then validates `session_token` in `Connection::authenticate_message()`.
 
-The `task` field is parsed into `commands::Task` and routed by `commands::dispatch()` (called from `Connection::handle_task()`). Recognized tasks: `play`, `pause`, `stop`, `seek`, `volume`. Anything else is `Unknown`. The playback engine does not exist yet (KAN-18/20/21), so recognized tasks are currently acknowledged as `not_yet_implemented` stubs; KAN-20 wires the real engine into `dispatch()`.
+The `task` field is parsed into `commands::Task` and routed by `commands::dispatch()` (called from `Connection::handle_task()`). Recognized tasks: `play`, `pause`, `stop`, `seek`, `volume`. Anything else is `Unknown`.
+
+`play` carries the stream URL in its payload and drives the real playback engine: `{ "task": "play", "data": { "url": "<http stream url>" }, "session_token": "<UUID>" }`. `dispatch()` calls `audio::player::PLAYER.play(url)`, which opens the output device lazily and spawns a decode thread (`audio::decode::stream_url_to_output`: HTTP fetch → Symphonia decode → Rubato resample → `AudioOutput`). `stop` calls `PLAYER.stop()`. `pause`/`seek`/`volume` are still acknowledged as `not_yet_implemented` stubs.
 
 **Task response (server → iOS, AES-GCM then base64 over TCP):**
 ```json
 { "status": "ok" | "error", "task": "<echoed task>", "data": <payload?>, "error": "<code?>" }
 ```
-`status` is `ok` for an accepted command, `error` otherwise. `data`/`error` are omitted when absent. Error codes so far: `unsupported_task` (unknown `task`), `missing_task` (no `task` field). The response is encrypted with the session key via `Security::encrypt_data()` (mirrors `decrypt_data`: `nonce(12) ‖ ciphertext`, base64). KAN-19 formalizes this protocol and KAN-24 expands the error taxonomy; the iOS client does not yet consume these responses.
+`status` is `ok` for an accepted command, `error` otherwise. `data`/`error` are omitted when absent. Error codes so far: `unsupported_task` (unknown `task`), `missing_task` (no `task` field), `missing_url` (`play` with no `data.url`), `playback_failed` (`play` could not open the audio device). The response is encrypted with the session key via `Security::encrypt_data()` (mirrors `decrypt_data`: `nonce(12) ‖ ciphertext`, base64). KAN-19 formalizes this protocol and KAN-24 expands the error taxonomy; the iOS client does not yet consume these responses.
