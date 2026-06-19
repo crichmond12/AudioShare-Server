@@ -45,18 +45,31 @@ impl Task {
 /// `play` and `stop` drive the real playback engine ([`ENGINE`]); the remaining
 /// recognized tasks (`pause`/`seek`/`volume`) are still acknowledged with a
 /// `not_yet_implemented` note. `data` is the command payload (e.g. `play`'s
-/// stream URL).
+/// stream URL and target `zone`).
 pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
+    // The target zone defaults to "default" so clients that omit it (and the
+    // single-zone setup) keep working. An empty string is treated as absent.
+    let zone = match data["zone"].as_str() {
+        Some(z) if !z.is_empty() => z,
+        _ => "default",
+    };
     match task {
         Task::Play => match data["url"].as_str() {
-            Some(url) if !url.is_empty() => match ENGINE.play("default", url) {
+            Some(url) if !url.is_empty() => match ENGINE.play(zone, url) {
                 Ok(()) => {
-                    println!("Playing: {}", url);
+                    println!("Playing {} on zone {}", url, zone);
                     TaskResponse::accepted("play", None)
                 }
                 Err(e) => {
-                    println!("Playback failed for {}: {}", url, e);
-                    TaskResponse::error("play", "playback_failed")
+                    println!("Playback failed for {} on zone {}: {}", url, zone, e);
+                    // Surface routing errors distinctly; everything else (device
+                    // open, thread spawn) is a generic playback failure.
+                    let code = match e.as_str() {
+                        "unknown_zone" => "unknown_zone",
+                        "zone_has_no_outputs" => "zone_has_no_outputs",
+                        _ => "playback_failed",
+                    };
+                    TaskResponse::error("play", code)
                 }
             },
             _ => {
@@ -65,8 +78,9 @@ pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
             }
         },
         Task::Stop => {
-            ENGINE.stop("default");
-            println!("Stopped playback");
+            // stop is a no-op for an unknown/idle zone, so it always succeeds.
+            ENGINE.stop(zone);
+            println!("Stopped playback on zone {}", zone);
             TaskResponse::accepted("stop", None)
         }
         Task::Unknown(ref name) => {
@@ -132,5 +146,16 @@ mod tests {
         assert!(json.contains("\"status\":\"error\""));
         assert!(json.contains("\"error\":\"unsupported_task\""));
         assert!(json.contains("\"task\":\"teleport\""));
+    }
+
+    #[test]
+    fn play_unknown_zone_errors_before_touching_device() {
+        // An unknown zone is rejected by the engine before any device access,
+        // so this is device-free. The `default` zone is never targeted here.
+        let data = serde_json::json!({ "url": "http://example.com/s", "zone": "nope" });
+        let json = dispatch(Task::Play, &data).to_json();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"unknown_zone\""));
+        assert!(json.contains("\"task\":\"play\""));
     }
 }
