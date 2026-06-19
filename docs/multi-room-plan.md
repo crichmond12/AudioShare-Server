@@ -305,6 +305,19 @@ Snapcast:  audio transport + clock sync + low-level grouping  (impl detail)
 **Build order within Change 5 (sub-steps):**
 1. Hub supervises `snapserver` + `SnapcastSink` writing one zone's PCM into it;
    verify with a stock `snapclient` on a laptop before any custom agent/image.
+   **Building blocks landed (`src/audio/snapcast.rs`):** `SnapcastSink`
+   (`impl AudioSink`; interleaved `f32` → `s16le` into a `snapserver` pipe FIFO,
+   opened non-blocking + lazily so the decode thread never stalls waiting on
+   snapserver, dropping on `ENXIO`/`WouldBlock`/broken-pipe like the local
+   output's overrun handling) and `SnapserverSupervisor` (spawns a `snapserver`
+   with one `pipe://…?mode=create&sampleformat=48000:16:2&codec=pcm` stream,
+   restarts it on exit, kills on drop — no JSON-RPC yet; grouping is sub-step 3).
+   Unit-tested device-free; the audio+sync path is the opt-in
+   `audio::snapcast::tests::plays_to_snapcast_briefly` (`--ignored`, needs
+   `snapserver`/`snapclient` + hardware). **Still open in sub-step 1:** these
+   are not yet referenced by the engine — registering a Snapcast output into the
+   `OutputRegistry` and routing a zone to it rides along with sub-step 2's
+   registration work.
 2. Custom dongle agent: registration protocol to the hub + `snapclient`
    supervision; hub registers it into `OutputRegistry`.
 3. Hub programs snapserver groups/streams from zone membership (sync + grouping).
