@@ -326,6 +326,89 @@ Snapcast:  audio transport + clock sync + low-level grouping  (impl detail)
 Sub-step 1 proves the audio+sync path with zero custom dongle code, so the risky
 custom-agent/image work is itself sequenced last.
 
+#### Sub-step 2 — detailed plan (locked 2026-06)
+
+The custom dongle agent + hub registration. Decisions below are settled; code
+them in this order. Update `CLAUDE.md` (protocol/state source of truth) as each
+commit lands — this doc holds the plan, `CLAUDE.md` holds the shipped reality.
+
+**What it delivers — and the one honest limit.** A device running our **dongle
+agent** is claimed by a hub through the app, registers itself, and becomes an
+`OutputRegistry` entry; the agent supervises a `snapclient` pointed at the hub's
+`snapserver`, so `play {url, zone:<dongle>}` makes sound at that dongle — our own
+code on both ends. **Limit:** there is **one `snapserver` stream** in sub-step 2,
+so every registered dongle is a `snapclient` of that one stream and they all play
+the *same* audio (one synchronized group). Per-dongle **independent** routing
+needs multiple streams + group assignment via snapserver JSON-RPC — that is
+**sub-step 3**, by design. Sub-step 2 registers each dongle under its own output
+id (forward-compatible) but the shared stream means routing to any dongle feeds
+all of them until sub-step 3. Comment this loudly so it isn't mistaken for a bug.
+
+**Locked decisions:**
+1. **Workspace, minimal churn.** Keep the `audio_share` package at the repo root
+   (`Cargo.toml` + `src/` unchanged so `compile.sh`/`to_pi.sh`/`run.sh` keep
+   working) and add a `[workspace]` table to that same file:
+   `members = [".", "crates/protocol", "crates/dongle_agent"]`. A root crate may
+   also be a workspace root. New crates live under `crates/`; the hub and the
+   agent both depend on `protocol` by path. This is *the* reason the agent is not
+   a separate repo — shared Rust types, no wire drift (the problem we fight with
+   iOS).
+2. **`crates/protocol` — pure serde control types + framing.** Audio never flows
+   here (Snapcast carries audio); this is registration/control only, which keeps
+   its security surface small. Framing: **newline-delimited JSON** over TCP
+   (`serde_json` + `\n`, tokio `BufReader::read_line`) — debuggable with `nc`.
+   Messages:
+   - `Dongle → Hub`: `Register { dongle_id, name }`.
+   - `Hub → Dongle`: `Registered { snapserver_host, snapserver_port }`.
+   - `App → Dongle`: `Assign { hub_host, hub_port }` + ack (the discovery flow).
+   - Heartbeat/health and `Stop`/`Assign{zone}` are deferred (grouping is
+     sub-step 3).
+3. **Identity.** The dongle generates a UUID once and persists it (mirrors the
+   hub's `pairing_secret.b64`) and sends a default `name` (its hostname). The hub
+   uses `dongle_id` as the `OutputId`.
+4. **App-mediated discovery (resolves multiple hubs on one LAN).** The dongle
+   does **not** auto-pick a hub. Unassigned, it advertises via mDNS as
+   `_audioshare-dongle._tcp` (id + name in TXT) and runs a small **assignment
+   listener**. The app — already paired to one specific hub — browses for
+   unassigned dongles, the user taps "add to this hub," and the app sends the
+   dongle `Assign { hub_host, hub_port }`. The dongle persists that address and
+   switches to the dongle→hub registration flow, reconnecting to *that* hub on
+   every boot. A `--hub <ip>` CLI flag stays as a **dev-only** bring-up shortcut.
+   This puts the "which hub" choice where the human + multi-hub knowledge are.
+5. **Hub registration listener.** New `src/server/dongle_server.rs` parallel to
+   `connection_server.rs`, on a **new port 50506**, spawned as a third
+   `tokio::spawn` in `Server::start()` beside `ConnectServer` and `Broadcast`.
+   On `Register`: `ENGINE.register_dongle(id, name)`, reply `Registered { hub LAN
+   IP, 1704 }`, hold the connection; on EOF → `ENGINE.dongle_offline(id)`.
+6. **Auth deferred.** The dongle channel is control-only on the user's own LAN
+   with user-flashed devices, so it ships **unauthenticated** in sub-step 2.
+   Recorded as a known gap; revisit if/when the threat model warrants it.
+7. **Engine/registry wiring (turns sub-step 1's blocks live; drops
+   `snapcast.rs`'s `#![allow(dead_code)]`).** `Engine` holds a
+   `Mutex<Option<SnapserverSupervisor>>` + a shared `Arc<SnapcastSink>`.
+   `ensure_snapcast()` is lazy, mirroring `ensure_local()` (construction still
+   opens nothing). `register_dongle(id, name)` → `ensure_snapcast()`, register
+   `Output { id, name, sink: shared snapcast sink, online:true }`, and
+   **auto-create a zone `id → [id]`** so `play {zone:<dongle>}` works without
+   zone-CRUD (a later protocol change). `dongle_offline(id)` → `set_online(false)`.
+
+**Commit order (each independently shippable):**
+- **2.1** Workspace + `protocol` crate. Pure refactor; `cargo test` stays green.
+- **2.2** Hub listener + engine/registry wiring. Demo gate: register via `nc` +
+  a stock `snapclient -h <hub>`, then `play {zone:<id>}` → sound. No agent code
+  in this commit, so the hub path is proven before the risky network code.
+- **2.3** `crates/dongle_agent`: mDNS advertise + assignment listener + persisted
+  hub address + register + **supervise `snapclient`** (reuse the
+  `SnapserverSupervisor` spawn/monitor/restart/kill-on-drop pattern; the agent
+  *delegates* — it never does transport or clock-sync itself). Demo gate: run the
+  agent on a laptop, assign it (or `--hub`), `play {zone:<dongle>}` → sound.
+- **2.4** Resilience (reconnect/backoff), optional heartbeat, docs (`CLAUDE.md`
+  dongle protocol section + this doc), protocol round-trip + device-free
+  registration tests.
+- **2.5** iOS app: scan `_audioshare-dongle._tcp`, assign to the current hub —
+  **cross-project**, mirrored in `~/Documents/Audio Share/`. Sequenced after the
+  headless hub+agent path works.
+
 ---
 
 ## Suggested execution order
