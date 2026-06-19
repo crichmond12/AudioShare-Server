@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use lazy_static::lazy_static;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use crate::server::{connection_server, broadcast};
+use crate::server::{connection_server, broadcast, dongle_server};
 
 pub struct Server {
     sessions: Arc<Mutex<HashMap<Uuid, Security>>>,
@@ -21,6 +21,7 @@ impl Server {
     pub async fn start(self: Arc<Self>) {
         let connection_server = Arc::new(connection_server::ConnectServer::new());
         let broadcaster = Arc::new(broadcast::Broadcast::new());
+        let dongle_server = Arc::new(dongle_server::DongleServer::new());
 
         let server_handle = tokio::spawn(async move {
             let connect_server = Arc::clone(&connection_server);
@@ -32,7 +33,12 @@ impl Server {
             broadcast.start_broadcast().await;
         });
 
-        let _ = tokio::try_join!(broadcast_handle, server_handle);
+        let dongle_handle = tokio::spawn(async move {
+            let dongle_server = Arc::clone(&dongle_server);
+            dongle_server.start_server().await;
+        });
+
+        let _ = tokio::try_join!(broadcast_handle, server_handle, dongle_handle);
     }
 
     pub async fn store_session(&self, client_uuid: Uuid, sec: Security) -> bool {

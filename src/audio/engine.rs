@@ -28,6 +28,7 @@ use crate::audio::decode;
 use crate::audio::output::AudioOutput;
 use crate::audio::registry::{Output, OutputId, OutputRegistry};
 use crate::audio::sink::AudioSink;
+use crate::audio::snapcast::{self, SnapcastSink, SnapserverSupervisor};
 
 /// Reserved id for the host's own cpal output device.
 const LOCAL_OUTPUT_ID: &str = "local";
@@ -66,6 +67,18 @@ struct ZonePlayback {
 pub struct Engine {
     registry: Arc<OutputRegistry>,
     zones: Mutex<HashMap<ZoneId, ZonePlayback>>,
+    /// The supervised `snapserver`, spawned lazily on the first dongle
+    /// registration (see [`ensure_snapcast`](Self::ensure_snapcast)). `None`
+    /// until then so construction and the local-only path touch no process.
+    snapserver: Mutex<Option<SnapserverSupervisor>>,
+    /// The single shared sink feeding `snapserver`'s one input stream. Every
+    /// registered dongle's output points at *this* sink, so in sub-step 2 all
+    /// dongles are snapclients of one stream and play the **same** audio (one
+    /// synchronized group). Per-dongle independent streams/grouping is sub-step 3
+    /// (snapserver JSON-RPC); until then, routing two zones to two dongles at once
+    /// would interleave both into this one FIFO and garble — by design, not a bug.
+    /// Constructing it does no I/O, so this is safe to build eagerly.
+    snapcast_sink: Arc<dyn AudioSink>,
 }
 
 impl Engine {
@@ -83,6 +96,10 @@ impl Engine {
         Self {
             registry: Arc::new(OutputRegistry::new()),
             zones: Mutex::new(zones),
+            snapserver: Mutex::new(None),
+            // I/O-free: the FIFO is opened lazily on first write once snapserver
+            // is reading it (see `SnapcastSink`).
+            snapcast_sink: Arc::new(SnapcastSink::new(snapcast::DEFAULT_FIFO_PATH)),
         }
     }
 
@@ -176,6 +193,59 @@ impl Engine {
             }
         }
     }
+
+    /// Spawn the supervised `snapserver` if it isn't already running. Idempotent
+    /// and lazy, mirroring [`ensure_local`](Self::ensure_local): the one place the
+    /// snapserver process is launched, so a missing `snapserver` binary surfaces
+    /// here (to the registering dongle) rather than at construction. Dongles can't
+    /// hear anything until snapserver is up, so registration depends on this.
+    fn ensure_snapcast(&self) -> Result<(), String> {
+        let mut guard = self
+            .snapserver
+            .lock()
+            .expect("engine snapserver mutex poisoned");
+        if guard.is_none() {
+            *guard = Some(SnapserverSupervisor::spawn()?);
+        }
+        Ok(())
+    }
+
+    /// Register a dongle as an output and ensure `snapserver` is running so its
+    /// `snapclient` has a stream to join. Called by the dongle registration
+    /// listener (`server::dongle_server`) when a dongle connects. Re-registration
+    /// (a dongle reconnecting) brings the existing output back online and keeps
+    /// its zone — including any in-flight playback — intact. Errors only if
+    /// `snapserver` can't be launched.
+    pub fn register_dongle(&self, id: &str, name: &str) -> Result<(), String> {
+        self.ensure_snapcast()?;
+        self.add_dongle_output(id, name);
+        Ok(())
+    }
+
+    /// Registry + zone bookkeeping for a dongle (no I/O — split out so it is
+    /// unit-testable without a `snapserver`). The dongle's output points at the
+    /// shared [`snapcast_sink`](Self::snapcast_sink); an auto-zone named after the
+    /// dongle is created so `play {zone:<dongle>}` works before zone CRUD exists.
+    fn add_dongle_output(&self, id: &str, name: &str) {
+        self.registry.register(Output {
+            id: id.to_string(),
+            name: name.to_string(),
+            sink: Arc::clone(&self.snapcast_sink),
+            online: true,
+        });
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        zones.entry(id.to_string()).or_insert_with(|| ZonePlayback {
+            outputs: vec![id.to_string()],
+            current: None,
+        });
+    }
+
+    /// Mark a dongle's output unreachable when it disconnects. The output stays
+    /// in the registry (so its zone/name persist for reconnection); it's just
+    /// skipped when resolving sinks for playback. No-op if the id is unknown.
+    pub fn dongle_offline(&self, id: &str) {
+        self.registry.set_online(id, false);
+    }
 }
 
 impl Default for Engine {
@@ -251,6 +321,50 @@ mod tests {
             .play("nonexistent", "http://example.com/stream")
             .unwrap_err();
         assert_eq!(err, "unknown_zone");
+    }
+
+    // A dongle registers as an online output (resolving to the shared snapcast
+    // sink) with an auto-zone named after it. Device-free: exercises only the
+    // registry/zone bookkeeping, not the snapserver spawn.
+    #[test]
+    fn add_dongle_output_registers_and_creates_zone() {
+        let engine = Engine::new();
+        engine.add_dongle_output("dongle-1", "Kitchen");
+
+        assert!(engine.registry.sink("dongle-1").is_some());
+        let zones = engine.zones.lock().expect("zones");
+        let zone = zones.get("dongle-1").expect("auto-zone created");
+        assert_eq!(zone.outputs, vec!["dongle-1".to_string()]);
+    }
+
+    // Disconnect marks the output offline (unresolvable for playback) but keeps
+    // its zone so a reconnecting dongle keeps its identity.
+    #[test]
+    fn dongle_offline_unresolves_sink_but_keeps_zone() {
+        let engine = Engine::new();
+        engine.add_dongle_output("dongle-1", "Kitchen");
+        engine.dongle_offline("dongle-1");
+
+        assert!(engine.registry.sink("dongle-1").is_none());
+        assert!(engine.zones.lock().expect("zones").contains_key("dongle-1"));
+    }
+
+    // Reconnecting (re-registering) an offline dongle brings it back online.
+    #[test]
+    fn re_register_brings_dongle_back_online() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d", "Name");
+        engine.dongle_offline("d");
+        assert!(engine.registry.sink("d").is_none());
+
+        engine.add_dongle_output("d", "Name");
+        assert!(engine.registry.sink("d").is_some());
+    }
+
+    #[test]
+    fn dongle_offline_unknown_is_noop() {
+        let engine = Engine::new();
+        engine.dongle_offline("nonexistent");
     }
 
     // Live end-to-end smoke test through the full engine: play the default zone

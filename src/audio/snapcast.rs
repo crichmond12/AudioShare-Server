@@ -20,12 +20,6 @@
 //! registration, and hub-driven grouping are later sub-steps and do not touch
 //! this file's contract.
 
-// `SnapcastSink`/`SnapserverSupervisor` are the sub-step 1 building blocks; they
-// are exercised by the unit + ignored tests but not yet referenced from the
-// engine/registry. Wiring a Snapcast output into the `OutputRegistry` and zones
-// is a later Change 5 sub-step (dongle registration). Allow until then.
-#![allow(dead_code)]
-
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::OpenOptionsExt;
