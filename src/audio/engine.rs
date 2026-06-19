@@ -1,0 +1,311 @@
+//! Playback engine (multi-room Changes 2 + 3; was `player.rs`).
+//!
+//! [`Engine`] owns the [`OutputRegistry`] and one in-flight decode pipeline
+//! *per zone*. A **zone** is a named group of outputs that share playback;
+//! `play(zone, url)` streams a URL to that zone's outputs and `stop(zone)`
+//! halts just that zone. This replaces the single-stream `Player`: the engine
+//! can now drive several zones independently (the headline multi-room feature).
+//!
+//! For this step there is one `"default"` zone targeting the single `"local"`
+//! output, so externally observable behavior matches the old single-zone
+//! engine. Reading the target zone off the wire is Change 4; real second
+//! outputs (network sinks / dongles) are Change 5.
+//!
+//! A process-wide [`ENGINE`] is exposed so `commands::dispatch` can reach it
+//! without threading a handle through every `Connection`, mirroring the
+//! `MAIN_SERVER` global in `server::server`. Critically, constructing `ENGINE`
+//! does **not** open the audio device — the local device is opened lazily on
+//! first `play` so device-free paths (`stop`, tests) never need hardware.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+
+use lazy_static::lazy_static;
+
+use crate::audio::decode;
+use crate::audio::output::AudioOutput;
+use crate::audio::registry::{Output, OutputId, OutputRegistry};
+use crate::audio::sink::AudioSink;
+
+/// Reserved id for the host's own cpal output device.
+const LOCAL_OUTPUT_ID: &str = "local";
+/// Zone used until the protocol carries a target zone (Change 4).
+const DEFAULT_ZONE: &str = "default";
+
+lazy_static! {
+    /// Process-wide playback engine used by `commands::dispatch`.
+    pub static ref ENGINE: Engine = Engine::new();
+}
+
+/// Name of a zone (a group of outputs sharing playback).
+pub type ZoneId = String;
+
+/// A running decode pipeline: its cooperative stop flag and the thread driving it.
+struct Pipeline {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl Pipeline {
+    /// Signal the decode thread to stop and wait for it to exit.
+    fn shutdown(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.handle.join();
+    }
+}
+
+/// A zone's membership plus its current in-flight playback (if any).
+struct ZonePlayback {
+    outputs: Vec<OutputId>,
+    current: Option<Pipeline>,
+}
+
+/// The multi-room playback engine. Shared process-wide via [`ENGINE`].
+pub struct Engine {
+    registry: Arc<OutputRegistry>,
+    zones: Mutex<HashMap<ZoneId, ZonePlayback>>,
+}
+
+impl Engine {
+    pub fn new() -> Self {
+        // One default zone targeting the local device. Note: this does NOT open
+        // the device — `ensure_local` does that lazily on first play.
+        let mut zones = HashMap::new();
+        zones.insert(
+            DEFAULT_ZONE.to_string(),
+            ZonePlayback {
+                outputs: vec![LOCAL_OUTPUT_ID.to_string()],
+                current: None,
+            },
+        );
+        Self {
+            registry: Arc::new(OutputRegistry::new()),
+            zones: Mutex::new(zones),
+        }
+    }
+
+    /// Open the host's cpal device if it isn't already, register it as the
+    /// `"local"` output, and return its sink. Idempotent and the only place the
+    /// audio device is acquired — so the device-open error surfaces here (as
+    /// today's `playback_failed`) rather than at construction.
+    fn ensure_local(&self) -> Result<Arc<dyn AudioSink>, String> {
+        if let Some(sink) = self.registry.sink(LOCAL_OUTPUT_ID) {
+            return Ok(sink);
+        }
+        let sink: Arc<dyn AudioSink> = Arc::new(AudioOutput::new()?);
+        self.registry.register(Output {
+            id: LOCAL_OUTPUT_ID.to_string(),
+            name: "Local".to_string(),
+            sink: Arc::clone(&sink),
+            online: true,
+        });
+        Ok(sink)
+    }
+
+    /// Resolve a zone's online outputs to a single sink to decode into: the lone
+    /// sink directly when there's exactly one (preserving its native rate), or a
+    /// [`FanOut`] over several. Errors if the zone is unknown or has no
+    /// reachable outputs.
+    fn zone_sink(&self, outputs: &[OutputId]) -> Result<Arc<dyn AudioSink>, String> {
+        // The local device is opened on demand; other outputs (dongles) must
+        // already be registered + online to participate.
+        if outputs.iter().any(|o| o == LOCAL_OUTPUT_ID) {
+            self.ensure_local()?;
+        }
+
+        let mut sinks: Vec<Arc<dyn AudioSink>> = outputs
+            .iter()
+            .filter_map(|id| self.registry.sink(id))
+            .collect();
+
+        match sinks.len() {
+            0 => Err("zone_has_no_outputs".to_string()),
+            // Single sink: pass through directly so decode resamples to the
+            // device's own rate. Wrapping in FanOut would force a canonical rate
+            // the device may not run at.
+            1 => Ok(sinks.pop().expect("len checked")),
+            _ => Ok(Arc::new(FanOut::new(sinks))),
+        }
+    }
+
+    /// Start streaming `url` to `zone`, replacing that zone's current playback.
+    /// Other zones are unaffected. Returns an error if the zone is unknown, has
+    /// no reachable outputs, or the local audio device can't be opened; later
+    /// stream/decode failures surface on the decode thread and simply end
+    /// playback.
+    pub fn play(&self, zone: &str, url: &str) -> Result<(), String> {
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        let outputs = zones
+            .get(zone)
+            .map(|z| z.outputs.clone())
+            .ok_or_else(|| "unknown_zone".to_string())?;
+
+        let sink = self.zone_sink(&outputs)?;
+
+        // Stop this zone's existing playback before starting the new stream.
+        let zone_state = zones.get_mut(zone).expect("zone existed above");
+        if let Some(pipeline) = zone_state.current.take() {
+            pipeline.shutdown();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread_url = url.to_string();
+
+        let handle = thread::Builder::new()
+            .name(format!("decode-{zone}"))
+            .spawn(move || {
+                if let Err(e) = decode::stream_url_to_output(&thread_url, &*sink, &thread_stop) {
+                    eprintln!("playback ended: {e}");
+                }
+            })
+            .map_err(|e| format!("failed to spawn decode thread: {e}"))?;
+
+        zone_state.current = Some(Pipeline { stop, handle });
+        Ok(())
+    }
+
+    /// Stop `zone`'s current playback. No-op if the zone is unknown or idle.
+    pub fn stop(&self, zone: &str) {
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        if let Some(zone_state) = zones.get_mut(zone) {
+            if let Some(pipeline) = zone_state.current.take() {
+                pipeline.shutdown();
+            }
+        }
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// An [`AudioSink`] that forwards every write to several member sinks — the
+/// basis for independent multi-room within a zone (Phase 2). It reports a fixed
+/// canonical format that all members must accept; reconciling member device
+/// rates is deferred to Change 5 (network sinks negotiate a shared format).
+/// Only constructed for zones with ≥2 outputs, so it is unused until a real
+/// second output exists.
+struct FanOut {
+    sinks: Vec<Arc<dyn AudioSink>>,
+    sample_rate: u32,
+    channels: u16,
+}
+
+impl FanOut {
+    fn new(sinks: Vec<Arc<dyn AudioSink>>) -> Self {
+        // Canonical CD-ish stereo format; member sinks are expected to accept
+        // it. Proper negotiation is Change 5's job.
+        Self {
+            sinks,
+            sample_rate: 48_000,
+            channels: 2,
+        }
+    }
+}
+
+impl AudioSink for FanOut {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn write(&self, samples: &[f32]) {
+        for sink in &self.sinks {
+            sink.write(samples);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Constructing the engine must not touch audio hardware.
+    #[test]
+    fn new_does_not_open_audio_device() {
+        let engine = Engine::new();
+        // The local output is not registered until the first play.
+        assert!(engine.registry.sink(LOCAL_OUTPUT_ID).is_none());
+    }
+
+    // stop is a device-free no-op for both the default zone (idle) and an
+    // unknown zone.
+    #[test]
+    fn stop_is_noop_without_playback() {
+        let engine = Engine::new();
+        engine.stop(DEFAULT_ZONE);
+        engine.stop("nonexistent");
+    }
+
+    // play on an unknown zone errors before any device access.
+    #[test]
+    fn play_unknown_zone_errors() {
+        let engine = Engine::new();
+        let err = engine
+            .play("nonexistent", "http://example.com/stream")
+            .unwrap_err();
+        assert_eq!(err, "unknown_zone");
+    }
+
+    // Live end-to-end smoke test through the full engine: play the default zone
+    // — which lazily opens the local device, registers it, resolves the
+    // single-sink path, and streams — for ~3s, then stop. Requires network +
+    // audio hardware, so it is opt-in:
+    //   cargo test audio::engine::tests::engine_plays_default_zone_briefly -- --ignored --nocapture
+    // You should hear audio.
+    #[test]
+    #[ignore]
+    fn engine_plays_default_zone_briefly() {
+        use std::thread;
+        use std::time::Duration;
+
+        const URL: &str = "https://ice1.somafm.com/groovesalad-128-mp3";
+
+        let engine = Engine::new();
+        // Local device is not opened until play.
+        assert!(engine.registry.sink(LOCAL_OUTPUT_ID).is_none());
+
+        engine.play(DEFAULT_ZONE, URL).expect("play should start");
+        // ensure_local ran: the local output is now registered + online.
+        assert!(engine.registry.sink(LOCAL_OUTPUT_ID).is_some());
+
+        thread::sleep(Duration::from_secs(3));
+        engine.stop(DEFAULT_ZONE);
+    }
+
+    // FanOut forwards writes to every member sink.
+    #[test]
+    fn fanout_forwards_to_all_sinks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(Arc<AtomicUsize>);
+        impl AudioSink for Counter {
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn channels(&self) -> u16 {
+                2
+            }
+            fn write(&self, samples: &[f32]) {
+                self.0.fetch_add(samples.len(), Ordering::Relaxed);
+            }
+        }
+
+        let a = Arc::new(AtomicUsize::new(0));
+        let b = Arc::new(AtomicUsize::new(0));
+        let fanout = FanOut::new(vec![
+            Arc::new(Counter(Arc::clone(&a))),
+            Arc::new(Counter(Arc::clone(&b))),
+        ]);
+
+        fanout.write(&[0.0; 4]);
+        assert_eq!(a.load(Ordering::Relaxed), 4);
+        assert_eq!(b.load(Ordering::Relaxed), 4);
+    }
+}

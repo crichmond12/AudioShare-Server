@@ -1,4 +1,4 @@
-use crate::audio::player::PLAYER;
+use crate::audio::engine::ENGINE;
 use crate::json_structs::task_response::TaskResponse;
 use serde_json::{json, Value};
 
@@ -42,14 +42,14 @@ impl Task {
 
 /// Route a parsed task to its handler and produce the response to send back.
 ///
-/// `play` and `stop` drive the real playback engine ([`PLAYER`]); the remaining
+/// `play` and `stop` drive the real playback engine ([`ENGINE`]); the remaining
 /// recognized tasks (`pause`/`seek`/`volume`) are still acknowledged with a
 /// `not_yet_implemented` note. `data` is the command payload (e.g. `play`'s
 /// stream URL).
 pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
     match task {
         Task::Play => match data["url"].as_str() {
-            Some(url) if !url.is_empty() => match PLAYER.play(url) {
+            Some(url) if !url.is_empty() => match ENGINE.play("default", url) {
                 Ok(()) => {
                     println!("Playing: {}", url);
                     TaskResponse::accepted("play", None)
@@ -65,7 +65,7 @@ pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
             }
         },
         Task::Stop => {
-            PLAYER.stop();
+            ENGINE.stop("default");
             println!("Stopped playback");
             TaskResponse::accepted("stop", None)
         }
