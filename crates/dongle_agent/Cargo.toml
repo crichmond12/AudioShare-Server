@@ -1,0 +1,27 @@
+[package]
+name = "dongle_agent"
+version = "0.1.0"
+edition = "2021"
+
+# The custom dongle agent (multi-room Change 5, sub-step 2.3). Runs on a small
+# networked receiver at a speaker: it carries identity + hub assignment +
+# registration, and *supervises* a stock `snapclient` (it never does audio
+# transport or clock-sync itself — Snapcast does, behind this seam). It lives in
+# the hub workspace purely to share `audioshare_protocol`, so the hub<->dongle
+# control contract can't drift. See `docs/multi-room-plan.md`.
+
+[[bin]]
+name = "dongle_agent"
+path = "src/main.rs"
+
+[dependencies]
+# Single source of truth for the hub<->dongle control wire types + framing.
+audioshare_protocol = { path = "../protocol" }
+# Async TCP for the assignment listener + the hub registration connection.
+tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# Advertise this dongle as `_audioshare-dongle._tcp` while unassigned.
+mdns-sd = "0.11.1"
+# Resolve our LAN IP for the mDNS advert.
+local-ip-address = "0.6.1"
+# Stable, persisted dongle identity (becomes the hub's OutputId).
+uuid = { version = "1.8.0", features = ["v4"] }

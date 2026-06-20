@@ -531,6 +531,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dongle_agent"
+version = "0.1.0"
+dependencies = [
+ "audioshare_protocol",
+ "local-ip-address",
+ "mdns-sd",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "either"
 version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

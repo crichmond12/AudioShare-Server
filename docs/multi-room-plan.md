@@ -397,17 +397,70 @@ all of them until sub-step 3. Comment this loudly so it isn't mistaken for a bug
 - **2.2** Hub listener + engine/registry wiring. Demo gate: register via `nc` +
   a stock `snapclient -h <hub>`, then `play {zone:<id>}` → sound. No agent code
   in this commit, so the hub path is proven before the risky network code.
-- **2.3** `crates/dongle_agent`: mDNS advertise + assignment listener + persisted
-  hub address + register + **supervise `snapclient`** (reuse the
-  `SnapserverSupervisor` spawn/monitor/restart/kill-on-drop pattern; the agent
-  *delegates* — it never does transport or clock-sync itself). Demo gate: run the
-  agent on a laptop, assign it (or `--hub`), `play {zone:<dongle>}` → sound.
+- **2.3** ✅ **Landed.** `crates/dongle_agent`: a workspace binary crate sharing
+  `audioshare_protocol` with the hub. Modules: `storage` (persisted UUID + name +
+  assigned-hub address, atomic writes mirroring `pairing.rs`; `Storage::at` makes
+  it testable), `assignment` (mDNS advertise as `_audioshare-dongle._tcp` +
+  assignment listener on `DONGLE_ASSIGNMENT_PORT`; `await_assignment` returns the
+  app-chosen hub), `registration` (`run_session`: connect → `Register` → read
+  `Registered` → start snapclient → hold the connection as liveness), `supervisor`
+  (`SnapclientSupervisor`, a copy of the `SnapserverSupervisor`
+  spawn/monitor/restart/kill-on-drop pattern spawning `snapclient -h <host> -p
+  <port> --hostID <dongle_id>`; the agent *delegates* — it never does transport or
+  clock-sync itself). `main` resolves the hub as `--hub` flag (dev shortcut, also
+  persisted) > persisted assignment > `await_assignment`, then reconnects on a
+  fixed delay. Device-free unit tests for storage + arg building pass; the
+  `snapclient`/network path is exercised by the demo gate, not CI. Demo gate: run
+  the agent on a laptop, assign it (or `--hub`), `play {zone:<dongle>}` → sound.
 - **2.4** Resilience (reconnect/backoff), optional heartbeat, docs (`CLAUDE.md`
   dongle protocol section + this doc), protocol round-trip + device-free
   registration tests.
 - **2.5** iOS app: scan `_audioshare-dongle._tcp`, assign to the current hub —
   **cross-project**, mirrored in `~/Documents/Audio Share/`. Sequenced after the
   headless hub+agent path works.
+
+#### Bring-up notes (first real laptop-as-dongle demo, 2026-06-20)
+
+The sub-step 2.3 path was proven end-to-end (Pi hub → laptop running the agent +
+stock `snapclient` → audio out the laptop). Hard-won gotchas, so the next session
+doesn't rediscover them:
+
+1. **Disable the distro's `snapserver.service`.** `apt install snapserver`
+   enables a systemd service that auto-starts a `snapserver` on boot, which grabs
+   ports **1704/1705**. The hub spawns and supervises its **own** `snapserver`
+   (`SnapserverSupervisor`), so the system one squats on the port and the hub's
+   instance can't bind it — `snapclient` then connects to the *system* server's
+   empty `default` stream and you get silence. Fix on the Pi:
+   `sudo systemctl disable --now snapserver`. **This belongs in the install docs /
+   flashable-image setup** — it'll bite every user. (A more self-contained fix:
+   have the hub launch `snapserver` with an explicit minimal config so it never
+   collides — worth considering for packaging.)
+2. **New `snapclient`s land on the wrong stream.** `snapserver.conf` ships a
+   `default` stream; a freshly-connected client is placed in a group bound to
+   `default`, **not** the hub's `AudioShare` pipe stream — so even with audio
+   flowing into `AudioShare`, the client hears nothing. Manual workaround via the
+   control RPC on 1705:
+   `Group.SetStream {id:<group>, stream_id:"AudioShare"}` (find `<group>` from
+   `Server.GetStatus`). **This is exactly what sub-step 3 automates** — the hub
+   programs snapserver groups/streams from zone membership over JSON-RPC so it's
+   never manual. The manual RPC is also not persistent across reconnects.
+3. **iOS hardcoded `zone:"default"`.** `Library.swift` sent every `play`/`stop`
+   with `zone:"default"`, so playback always hit the hub's local output, never a
+   dongle. Added a free-text **Zone** field (type a dongle UUID to target it) as a
+   stepping stone toward the 2.5 picker. The dongle's UUID (its `OutputId`) is
+   printed at agent startup and is the zone id to target.
+4. **Choppy audio over the Snapcast path (KAN-23, Snapcast variant).** Real
+   playback came through but stuttered ("stop and start"). Root cause is the
+   `SnapcastSink`: it opens the FIFO **non-blocking** and **drops** samples on
+   `WouldBlock` (pipe full). That non-blocking stance is right *before* snapserver
+   is reading (so the decode thread never stalls waiting for it to come up), but
+   once snapserver is draining the FIFO at real time a **blocking** write is the
+   natural backpressure that paces the decode thread — dropping on overflow
+   instead guarantees gaps. Fix direction: keep the non-blocking lazy open to
+   detect snapserver, then switch the handle to blocking once connected (clear
+   `O_NONBLOCK` via `fcntl`), or feed snapserver through a paced ring buffer. This
+   is the Snapcast-path sibling of the local-output prebuffering already done in
+   commit 550a50d; the local fix doesn't cover this sink.
 
 ---
 
