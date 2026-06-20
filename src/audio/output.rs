@@ -29,8 +29,19 @@ use std::time::Duration;
 /// Upper bound on buffered samples, so a producer that outruns the output device
 /// cannot grow memory without limit. When exceeded, the oldest samples are
 /// dropped (bounding latency). Proper bounded buffering is KAN-23's job; this is
-/// just a safety valve. ~4s of stereo audio at 48 kHz.
-const MAX_BUFFERED_SAMPLES: usize = 48_000 * 2 * 4;
+/// just a safety valve. ~12s of stereo audio at 48 kHz — deliberately larger
+/// than a typical icecast "burst-on-connect" (several seconds delivered at once)
+/// so that initial burst lands in the buffer instead of overflowing and dropping
+/// not-yet-played samples, which was audible as skipping at the start of a stream.
+const MAX_BUFFERED_SAMPLES: usize = 48_000 * 2 * 12;
+
+/// How much audio to accumulate before the output stream starts draining, so
+/// realtime-paced network jitter doesn't underrun the device on the first
+/// callbacks (heard as choppiness). ~0.6s of stereo at 48 kHz; the device's real
+/// rate/channels are used at runtime (see `build_stream`). Part of the KAN-23
+/// jitter-handling work, kept simple (a fixed cushion, no adaptive sizing).
+const PREBUFFER_SECONDS_NUM: usize = 3;
+const PREBUFFER_SECONDS_DEN: usize = 5;
 
 type SampleBuffer = Arc<Mutex<VecDeque<f32>>>;
 
@@ -177,11 +188,32 @@ fn build_stream<T>(
 where
     T: SizedSample + FromSample<f32>,
 {
+    // Cushion (in samples) to accumulate before the first real output, sized
+    // from this device's actual rate/channels.
+    let prebuffer_samples = config.sample_rate.0 as usize
+        * config.channels as usize
+        * PREBUFFER_SECONDS_NUM
+        / PREBUFFER_SECONDS_DEN;
+    // `primed` flips true once the cushion is first reached; the callback is
+    // FnMut, so this per-stream state lives in the closure (no atomics needed).
+    let mut primed = false;
+
     device
         .build_output_stream(
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 let mut buf = buffer.lock().expect("audio buffer poisoned");
+                if !primed {
+                    if buf.len() < prebuffer_samples {
+                        // Not enough buffered yet — emit silence and keep filling
+                        // so playback starts from a cushion rather than underrunning.
+                        for slot in data.iter_mut() {
+                            *slot = T::from_sample(0.0f32);
+                        }
+                        return;
+                    }
+                    primed = true;
+                }
                 fill_output(&mut buf, data);
             },
             move |err| eprintln!("audio output stream error: {err}"),
