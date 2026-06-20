@@ -412,9 +412,32 @@ all of them until sub-step 3. Comment this loudly so it isn't mistaken for a bug
   fixed delay. Device-free unit tests for storage + arg building pass; the
   `snapclient`/network path is exercised by the demo gate, not CI. Demo gate: run
   the agent on a laptop, assign it (or `--hub`), `play {zone:<dongle>}` → sound.
-- **2.4** Resilience (reconnect/backoff), optional heartbeat, docs (`CLAUDE.md`
-  dongle protocol section + this doc), protocol round-trip + device-free
-  registration tests.
+- **2.4** ✅ **Landed.** Resilience + heartbeat + device-free tests.
+  - *Reconnect backoff* (`crates/dongle_agent/src/main.rs`): the fixed 3 s retry
+    is now exponential — `next_backoff` doubles `BACKOFF_BASE` (1 s) up to
+    `BACKOFF_MAX` (30 s); a session that stayed up ≥ `BACKOFF_RESET_AFTER` (30 s,
+    longer than the heartbeat timeout so a heartbeat-killed session doesn't count
+    as healthy) resets the delay. `next_backoff` is pure + unit-tested.
+  - *Heartbeat* (shared consts in `crates/protocol`): the dongle sends
+    `DongleToHub::Heartbeat` every `HEARTBEAT_INTERVAL_SECS` (5 s) on a dedicated
+    task (so the timed read is never cancelled mid-line — `read_line` isn't
+    cancel-safe), and the hub replies `HubToDongle::Heartbeat`. Both ends read
+    with a `HEARTBEAT_TIMEOUT_SECS` (15 s) timeout, so a WiFi dropout where TCP
+    never delivers a FIN is caught within that window: the hub marks the output
+    offline, the agent reconnects. Replaces relying solely on the held-open
+    connection's EOF.
+  - *Device-free tests:* protocol heartbeat round-trip
+    (`crates/protocol`); a loopback register → heartbeat-reply → offline cycle
+    against a `DongleServer` with a mock `DongleRegistrar`
+    (`src/server/dongle_server.rs`, no `snapserver`/hardware); and the agent's
+    `Assign`→`Assigned` handshake over loopback
+    (`crates/dongle_agent/src/assignment.rs`). The `snapclient`/`snapserver` audio
+    path stays exercised by the demo gate, not CI.
+  - *Refactor:* `DongleServer` reaches the engine through a `DongleRegistrar`
+    trait (production `EngineRegistrar` forwards to `ENGINE`) so connection
+    handling is testable with a mock.
+  - **Still deferred to later sub-steps:** auth on the dongle channel; iOS
+    scan-and-assign (2.5); hub-driven per-dongle grouping (sub-step 3).
 - **2.5** iOS app: scan `_audioshare-dongle._tcp`, assign to the current hub —
   **cross-project**, mirrored in `~/Documents/Audio Share/`. Sequenced after the
   headless hub+agent path works.

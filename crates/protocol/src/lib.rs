@@ -40,6 +40,18 @@ pub const DONGLE_MDNS_SERVICE_TYPE: &str = "_audioshare-dongle._tcp.local.";
 /// Default Snapcast stream port a dongle's `snapclient` connects to on the hub.
 pub const DEFAULT_SNAPSERVER_PORT: u16 = 1704;
 
+/// How often the dongle sends a [`DongleToHub::Heartbeat`] while registered
+/// (Change 5 sub-step 2.4). Both ends share this constant so the sender's
+/// cadence and the receiver's [`HEARTBEAT_TIMEOUT_SECS`] can't drift apart.
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 5;
+
+/// How long either end waits for a heartbeat (or any line) before treating the
+/// peer as gone. Set to several missed intervals so a single dropped packet or
+/// a brief scheduling hiccup doesn't tear the session down; a real WiFi dropout
+/// (where TCP never delivers a FIN) is then caught within this window instead of
+/// hanging on a half-open connection forever.
+pub const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
+
 /// Agent → hub. Sent once the dongle knows its assigned hub (after [`AppToDongle::Assign`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -48,6 +60,10 @@ pub enum DongleToHub {
     /// persisted UUID (becomes the hub's `OutputId`); `name` is a human label
     /// (defaults to the hostname).
     Register { dongle_id: String, name: String },
+    /// Liveness ping sent every [`HEARTBEAT_INTERVAL_SECS`] while registered. The
+    /// hub replies with [`HubToDongle::Heartbeat`]; absence past
+    /// [`HEARTBEAT_TIMEOUT_SECS`] marks the dongle offline (Change 5 sub-step 2.4).
+    Heartbeat,
 }
 
 /// Hub → agent. The reply that tells the agent how to start `snapclient`.
@@ -59,6 +75,9 @@ pub enum HubToDongle {
         snapserver_host: String,
         snapserver_port: u16,
     },
+    /// Reply to a [`DongleToHub::Heartbeat`]. Lets the agent detect a dead hub
+    /// (its own read times out when these stop arriving) (Change 5 sub-step 2.4).
+    Heartbeat,
 }
 
 /// App → unassigned dongle. The app (paired to one specific hub) claims the
@@ -128,6 +147,12 @@ mod tests {
             dongle_id: "abc-123".to_string(),
         };
         assert_eq!(assigned, from_line(&to_line(&assigned).unwrap()).unwrap());
+
+        // Heartbeats (sub-step 2.4) carry no payload but must still round-trip.
+        let beat_up = DongleToHub::Heartbeat;
+        assert_eq!(beat_up, from_line(&to_line(&beat_up).unwrap()).unwrap());
+        let beat_down = HubToDongle::Heartbeat;
+        assert_eq!(beat_down, from_line(&to_line(&beat_down).unwrap()).unwrap());
     }
 
     #[test]

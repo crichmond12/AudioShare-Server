@@ -120,3 +120,81 @@ fn advertise(identity: &Identity) -> Result<ServiceDaemon, Box<dyn std::error::E
     mdns.register(service)?;
     Ok(mdns)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn identity() -> Identity {
+        Identity {
+            id: "dongle-1".to_string(),
+            name: "Kitchen".to_string(),
+        }
+    }
+
+    /// The app's assignment exchange over loopback: it sends `Assign` and the
+    /// dongle replies `Assigned` and yields the chosen hub. Device-free (no mDNS,
+    /// no snapclient) — exercises just the wire handshake.
+    #[tokio::test]
+    async fn assign_yields_hub_and_acks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let dongle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_assignment(stream, &identity()).await.unwrap()
+        });
+
+        // Stand in for the app.
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        let assign = AppToDongle::Assign {
+            hub_host: "192.168.1.10".to_string(),
+            hub_port: 50506,
+        };
+        write_half
+            .write_all(to_line(&assign).unwrap().as_bytes())
+            .await
+            .unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            from_line::<DongleToApp>(&line).unwrap(),
+            DongleToApp::Assigned {
+                dongle_id: "dongle-1".to_string()
+            }
+        );
+
+        let hub = dongle.await.unwrap();
+        assert_eq!(
+            hub,
+            Some(HubAddress {
+                host: "192.168.1.10".to_string(),
+                port: 50506,
+            })
+        );
+    }
+
+    /// A peer that connects then closes without sending an Assign is benign:
+    /// `handle_assignment` returns `Ok(None)` so the listener keeps waiting.
+    #[tokio::test]
+    async fn empty_connection_yields_none() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let dongle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_assignment(stream, &identity()).await.unwrap()
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        drop(client);
+
+        assert_eq!(dongle.await.unwrap(), None);
+    }
+}
