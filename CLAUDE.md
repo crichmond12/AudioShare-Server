@@ -37,12 +37,12 @@ Sequenced as vertical slices — each phase ends at something demoable. Jira (pr
 
 ## Two Services
 
-This project produces two separate binaries that run together on a Raspberry Pi:
+Historically this project produced two binaries. As of the 2026-06 pivot the Rust device server is the only one needed to run:
 
-- **`audioshare_device`** — Rust: TCP server (port 50505) + mDNS broadcast. This is the primary service the iOS client connects to.
-- **`audioshare_site`** — Go: HTTP REST API (default port 8080) backed by PostgreSQL. Handles user accounts and Spotify OAuth.
+- **`audioshare_device`** — Rust: TCP server (port 50505) + mDNS broadcast + dongle registration (50506) + an **account-auth stub on 8080** (`server/auth_server.rs`). This is the primary service the iOS client connects to.
+- **`audioshare_site`** — Go: HTTP REST API (port 8080) backed by PostgreSQL; user accounts + Spotify OAuth. **No longer required.** The iOS app gates its device screen behind a login (`/authenticateUser`, `/createUser`); the Rust auth stub now answers those with `{"success": true}` so a second binary + PostgreSQL isn't needed. Spotify OAuth is dead under the pivot, and pairing — not accounts — is the security boundary. The Go service remains in `site/` for reference but isn't deployed.
 
-`run.sh` expects both pre-built binaries to exist in the working directory under exactly those names.
+`run.sh` still references both binaries; for current testing only `audioshare_device` is run.
 
 ## Build & Run
 
@@ -89,6 +89,7 @@ python3 migrations/migrate.py
 - `server/connection_server.rs` — TCP listener (port 50505), handshake initiation, serial number read
 - `server/dongle_server.rs` — Change 5 sub-step 2.2: dongle registration listener (port 50506), parallel to `connection_server`. Reads a newline-delimited `audioshare_protocol::DongleToHub::Register`, calls `ENGINE.register_dongle`, replies `HubToDongle::Registered { snapserver_host, port }`, holds the connection as a liveness signal, and calls `ENGINE.dongle_offline` on disconnect. Control only (no audio; Snapcast carries that), **unauthenticated** for now (LAN, user-flashed dongles)
 - `server/broadcast.rs` — mDNS registration as `_audioshare._tcp.local.` on port 50505
+- `server/auth_server.rs` — account-auth stub (port 8080, warp). Replaces the Go `audioshare_site` for login: serves `/authenticateUser` and `/createUser`, always returning `{"success": true}` (no storage, no password check). Exists only because the iOS app gates its device screen behind a login; pairing is the real security boundary. The app POSTs to a hardcoded Pi IP here (login precedes mDNS discovery, so it can't use the discovered address)
 - `server/connection.rs` — per-client loop; validates `session_token` UUID on every message
 - `server/commands.rs` — parses the `task` field into `Task` and dispatches it; reads the optional target `zone` (default `"default"`) and drives `play`/`stop` on the engine, the rest are stubs
 - `audio/engine.rs` — `Engine` + global `ENGINE`: owns the `OutputRegistry` and one decode thread *per zone*; `play(zone, url)`/`stop(zone)`. Opens the local cpal device lazily on first play via `ensure_local` (construction touches no hardware, so `stop`/tests need none). `FanOut` fans a zone's stream to ≥2 outputs (unused until a real second output exists). Dongles register via `register_dongle(id, name)` (lazily spawns `snapserver` via `ensure_snapcast`, registers a Snapcast output backed by the shared `SnapcastSink`, auto-creates a zone `id → [id]`) and `dongle_offline(id)`. **Sub-step 2 limit:** all dongles share one `snapserver` stream, so they play the *same* audio (one synced group); independent per-dongle streams/grouping is sub-step 3 (snapserver JSON-RPC).
