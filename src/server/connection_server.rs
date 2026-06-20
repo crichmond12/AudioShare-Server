@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::io::BufRead;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use super::connection::Connection;
 use crate::security::Security;
@@ -28,7 +29,7 @@ impl ConnectServer {
     pub fn new() -> Self {
         let my_ip_address = local_ip().unwrap().to_string();
 
-        let pairing_secret = pairing::load_or_create(Path::new(pairing::PAIRING_SECRET_PATH))
+        let pairing_secret = pairing::load_or_create(&pairing::pairing_secret_path())
             .expect("Failed to load or create pairing secret — cannot start securely");
 
         match Self::get_serial_number() {

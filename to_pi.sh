@@ -2,15 +2,15 @@
 
 # Function to build Rust project
 build_rust() {
-		ssh pi "rm ./audioshare_device"
+		ssh pi "rm -f ./audioshare_device"
     ./env_exec.sh cargo build
 }
 
 # Function to build Go project
 build_go() {
-		ssh pi "rm ./audioshare_site"
+		ssh pi "rm -f ./audioshare_site"
     cd site
-		rm audioshare
+		rm -f audioshare
     ./../env_exec.sh go build
 		#cd DB
 		#./../../env_exec.sh go build migration.go

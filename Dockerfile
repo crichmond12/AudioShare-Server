@@ -13,11 +13,13 @@ RUN apt-get update && \
         openssh-server \
         pkg-config \
         libssl-dev \
+        libasound2-dev \
         gcc \
         g++ \
         make\
 				postgresql\
 				postgresql-contrib
+        # libasound2-dev: ALSA dev headers required by cpal's Linux backend (alsa-sys).
         # Add any additional packages you need
 
 USER postgres
@@ -36,6 +38,9 @@ COPY docker_entrypoint.sh /docker_entrypoint.sh
 RUN chmod +x /docker_entrypoint.sh
 #ENTRYPOINT ["/docker_entrypoint.sh"]
 
+# Installs current stable Rust at image-build time. The project needs the
+# edition2024 feature (cpal's macOS deps, indexmap >=2.14), i.e. Rust >= 1.85,
+# so rebuild this image if the toolchain ever falls behind.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 

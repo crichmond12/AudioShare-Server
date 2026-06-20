@@ -1,15 +1,30 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use base64::engine::general_purpose;
 use base64::Engine as _;
 
+/// On-disk location of the pairing secret.
+///
+/// Kept in the user's data directory so the service runs unprivileged. The
+/// previous `/etc/audio_share/` path required root to create, which broke
+/// `cargo run` as a normal user on the Pi. Honors `$XDG_DATA_HOME`, falling
+/// back to `~/.local/share`, then `/tmp` as a last resort.
 #[cfg(target_os = "linux")]
-pub const PAIRING_SECRET_PATH: &str = "/etc/audio_share/pairing_secret.b64";
+pub fn pairing_secret_path() -> PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join("audio_share").join("pairing_secret.b64")
+}
 
 #[cfg(not(target_os = "linux"))]
-pub const PAIRING_SECRET_PATH: &str = "/tmp/audio_share_pairing_secret.b64";
+pub fn pairing_secret_path() -> PathBuf {
+    std::env::temp_dir().join("audio_share_pairing_secret.b64")
+}
 
 pub fn load_or_create(path: &Path) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
     if path.exists() {
@@ -77,9 +92,31 @@ pub fn present_qr(payload: &str) {
     }
 }
 
+/// On the headless Pi there's no display, so render the QR as Unicode
+/// half-blocks straight to the terminal (e.g. the operator's SSH session) where
+/// the iOS app can scan it. Colors are inverted (light modules on a dark
+/// background) per the `qrcode` crate's terminal recipe so it scans on the
+/// typical dark terminal. Falls back to the raw payload if rendering fails.
 #[cfg(not(target_os = "macos"))]
 pub fn present_qr(payload: &str) {
+    use qrcode::QrCode;
+    use qrcode::render::unicode;
+
     println!("=== SCAN THIS QR CODE TO PAIR ===");
+
+    match QrCode::new(payload.as_bytes()) {
+        Ok(code) => {
+            let rendered = code
+                .render::<unicode::Dense1x2>()
+                .dark_color(unicode::Dense1x2::Light)
+                .light_color(unicode::Dense1x2::Dark)
+                .quiet_zone(true)
+                .build();
+            println!("{}", rendered);
+        }
+        Err(e) => eprintln!("Could not generate QR code (scan the payload below): {}", e),
+    }
+
     println!("{}", payload);
     println!("=================================");
 }
