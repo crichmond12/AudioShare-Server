@@ -158,16 +158,26 @@ impl Engine {
     /// stream/decode failures surface on the decode thread and simply end
     /// playback.
     pub fn play(&self, zone: &str, url: &str) -> Result<(), String> {
-        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
-        let outputs = zones
-            .get(zone)
-            .map(|z| z.outputs.clone())
-            .ok_or_else(|| "unknown_zone".to_string())?;
+        // Snapshot the zone's outputs under the lock, then RELEASE it: resolving
+        // the sink can spawn snapserver / make snapserver JSON-RPC calls (a
+        // network round-trip), and holding `zones` across that would stall every
+        // other engine method that locks `zones`.
+        let outputs = {
+            let zones = self.zones.lock().expect("engine zones mutex poisoned");
+            zones
+                .get(zone)
+                .map(|z| z.outputs.clone())
+                .ok_or_else(|| "unknown_zone".to_string())?
+        };
 
         let sink = self.zone_sink(zone, &outputs)?;
 
-        // Stop this zone's existing playback before starting the new stream.
-        let zone_state = zones.get_mut(zone).expect("zone existed above");
+        // Reacquire only to swap in the new pipeline. The zone may have been
+        // removed while the lock was released, and a concurrent play on the same
+        // zone may have installed a pipeline — taking+shutting the existing one
+        // before installing ours guarantees at most one active decoder per zone.
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        let zone_state = zones.get_mut(zone).ok_or_else(|| "unknown_zone".to_string())?;
         if let Some(pipeline) = zone_state.current.take() {
             pipeline.shutdown();
         }
@@ -233,12 +243,14 @@ impl Engine {
         let _ = OUTPUTS_CHANGED.send(());
     }
 
-    /// Register a dongle as an output and ensure `snapserver` is running so its
-    /// `snapclient` has a stream to join. Called by the dongle registration
+    /// Register a dongle as an output. Called by the dongle registration
     /// listener (`server::dongle_server`) when a dongle connects. Re-registration
     /// (a dongle reconnecting) brings the existing output back online and keeps
-    /// its zone — including any in-flight playback — intact. Errors only if
-    /// `snapserver` can't be launched.
+    /// its zone — including any in-flight playback — intact. Snapserver is NOT
+    /// launched here; it starts lazily on the first dongle-zone `play` via
+    /// `zone_sink` → `SnapcastRouter::sink_for_zone`. `reconcile_now` is called
+    /// so a reconnecting dongle lands on the right stream if its zone is already
+    /// playing. Always returns `Ok(())`.
     pub fn register_dongle(&self, id: &str, name: &str) -> Result<(), String> {
         self.add_dongle_output(id, name);
         self.notify_outputs_changed();
