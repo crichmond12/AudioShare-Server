@@ -6,7 +6,12 @@
 //! is insulated from snapserver version drift. Snapcast stays an implementation
 //! detail behind [`SnapcastControl`]; the engine never sees this type.
 
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 /// One snapserver group: its id, the stream it plays, and its client ids.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -72,9 +77,190 @@ pub trait SnapcastControl: Send + Sync {
     fn set_group_stream(&self, group: &str, stream: &str) -> Result<(), String>;
 }
 
+/// A synchronous JSON-RPC command connection to snapserver's control port.
+///
+/// One request → read lines until the matching `id` response (skipping any
+/// interleaved notifications). A `Mutex` serializes callers so request/response
+/// pairs never interleave on the socket.
+pub struct CommandConn {
+    inner: Mutex<ConnInner>,
+    next_id: AtomicU64,
+}
+
+struct ConnInner {
+    writer: TcpStream,
+    reader: BufReader<TcpStream>,
+}
+
+impl CommandConn {
+    /// Open a control connection to `host:port` (snapserver's JSON-RPC port).
+    pub fn connect(host: &str, port: u16) -> Result<Self, String> {
+        let stream = TcpStream::connect((host, port))
+            .map_err(|e| format!("snapserver control connect {host}:{port}: {e}"))?;
+        let reader = BufReader::new(
+            stream.try_clone().map_err(|e| format!("clone control socket: {e}"))?,
+        );
+        Ok(Self {
+            inner: Mutex::new(ConnInner { writer: stream, reader }),
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    /// Issue one JSON-RPC call and return its `result` value.
+    fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+
+        let mut guard = self.inner.lock().expect("snapcast control mutex poisoned");
+        let mut bytes = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+        bytes.push(b'\n');
+        guard.writer.write_all(&bytes).map_err(|e| format!("control write: {e}"))?;
+
+        // Read lines until the response whose id matches; skip notifications
+        // (no `id`) that may interleave.
+        loop {
+            let mut line = String::new();
+            let n = guard.reader.read_line(&mut line).map_err(|e| format!("control read: {e}"))?;
+            if n == 0 {
+                return Err("snapserver control closed the connection".to_string());
+            }
+            let msg: Value = match serde_json::from_str(line.trim()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if msg["id"].as_u64() == Some(id) {
+                if let Some(err) = msg.get("error").filter(|e| !e.is_null()) {
+                    return Err(format!("snapserver error: {err}"));
+                }
+                return Ok(msg["result"].clone());
+            }
+            // else: a notification or another id — keep reading.
+        }
+    }
+}
+
+impl SnapcastControl for CommandConn {
+    fn get_status(&self) -> Result<ServerStatus, String> {
+        let result = self.call("Server.GetStatus", json!({}))?;
+        parse_server_status(&result)
+    }
+
+    fn set_group_clients(&self, group: &str, clients: &[String]) -> Result<(), String> {
+        self.call("Group.SetClients", json!({ "id": group, "clients": clients }))?;
+        Ok(())
+    }
+
+    fn set_group_stream(&self, group: &str, stream: &str) -> Result<(), String> {
+        self.call("Group.SetStream", json!({ "id": group, "stream_id": stream }))?;
+        Ok(())
+    }
+}
+
+/// Listens on a dedicated snapserver control connection for client-(dis)connect
+/// notifications and fires `on_event` so the router can reconcile. Uses a second
+/// connection (not the command one) so reconcile-issued commands never deadlock
+/// against this read loop.
+pub struct EventListener {
+    stop: Arc<AtomicBool>,
+    stream: TcpStream,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl EventListener {
+    pub fn spawn(
+        host: &str,
+        port: u16,
+        on_event: impl Fn() + Send + 'static,
+    ) -> Result<Self, String> {
+        let stream = TcpStream::connect((host, port))
+            .map_err(|e| format!("snapserver event connect {host}:{port}: {e}"))?;
+        let read_stream = stream.try_clone().map_err(|e| format!("clone event socket: {e}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let handle = {
+            let stop = Arc::clone(&stop);
+            thread::Builder::new()
+                .name("snapcast-events".to_string())
+                .spawn(move || {
+                    let mut reader = BufReader::new(read_stream);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Ok(msg) = serde_json::from_str::<Value>(line.trim()) {
+                            if msg["method"].as_str().is_some_and(|m| {
+                                m.starts_with("Client.") || m == "Server.OnUpdate"
+                            }) {
+                                on_event();
+                            }
+                        }
+                    }
+                })
+                .map_err(|e| format!("spawn event thread: {e}"))?
+        };
+
+        Ok(Self { stop, stream, handle: Some(handle) })
+    }
+}
+
+impl Drop for EventListener {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Unblock the read loop's blocking read_line.
+        let _ = self.stream.shutdown(Shutdown::Both);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_conn_get_status_round_trips_over_tcp() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let req: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(req["method"], "Server.GetStatus");
+            let id = req["id"].clone();
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "server": { "groups": [
+                        { "id": "g0", "stream_id": "as-0",
+                          "clients": [ { "id": "d1", "connected": true } ] }
+                    ] }
+                }
+            });
+            let mut stream = stream;
+            let mut bytes = serde_json::to_vec(&resp).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).unwrap();
+        });
+
+        let conn = CommandConn::connect("127.0.0.1", addr.port()).expect("connect");
+        let status = conn.get_status().expect("get_status");
+        assert_eq!(status.group_of("d1"), Some("g0"));
+        server.join().unwrap();
+    }
 
     fn sample_status() -> serde_json::Value {
         serde_json::json!({
