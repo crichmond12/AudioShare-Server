@@ -535,6 +535,7 @@ name = "dongle_agent"
 version = "0.1.0"
 dependencies = [
  "audioshare_protocol",
+ "libc",
  "local-ip-address",
  "mdns-sd",
  "tokio",

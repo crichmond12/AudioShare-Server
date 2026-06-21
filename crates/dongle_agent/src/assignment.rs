@@ -12,9 +12,15 @@
 //! mDNS advert and listener are torn down as it returns (the dongle no longer
 //! needs to be discoverable once assigned).
 
+// mDNS advertising splits by OS (see `advertise`): on Linux we publish through
+// avahi (a subprocess), so the `mdns-sd` path and its helpers are only compiled
+// for non-Linux (macOS dev).
+#[cfg(not(target_os = "linux"))]
 use std::collections::HashMap;
 
+#[cfg(not(target_os = "linux"))]
 use local_ip_address::local_ip;
+#[cfg(not(target_os = "linux"))]
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -32,10 +38,10 @@ use crate::storage::{HubAddress, Identity};
 /// logged and the listener keeps waiting — only a successful [`AppToDongle::Assign`]
 /// ends the loop.
 pub async fn await_assignment(identity: &Identity) -> std::io::Result<HubAddress> {
-    // Keep the mDNS daemon alive for the lifetime of this call; dropping it
-    // unregisters the advert, which is exactly what we want once assigned.
-    let _mdns = match advertise(identity) {
-        Ok(daemon) => Some(daemon),
+    // Keep the advert alive for the lifetime of this call; dropping it
+    // unregisters the dongle, which is exactly what we want once assigned.
+    let _advert = match advertise(identity) {
+        Ok(advert) => Some(advert),
         Err(e) => {
             // Discovery degrades to the `--hub` dev shortcut if mDNS is
             // unavailable, but the assignment listener can still take a direct
@@ -95,10 +101,102 @@ async fn handle_assignment(
     }))
 }
 
-/// Register the dongle's mDNS advert (`_audioshare-dongle._tcp`) carrying its id
-/// and name in TXT so the app can list it before assignment. Mirrors the hub's
-/// `broadcast.rs`.
-fn advertise(identity: &Identity) -> Result<ServiceDaemon, Box<dyn std::error::Error + Send + Sync>> {
+/// A live mDNS advert; dropping it withdraws the dongle from discovery.
+///
+/// The responder differs by OS. On **Linux** the system mDNS responder is
+/// **avahi**, which owns port 5353 — running the `mdns-sd` crate as a *second*
+/// responder on the same host registers the service internally but avahi
+/// suppresses its records, so the advert never reaches the network (observed on
+/// Raspberry Pi OS: the agent logged "Advertising" yet `avahi-browse` on the
+/// same Pi saw nothing). So on Linux we publish *through* avahi via
+/// `avahi-publish-service`, held as a child process for the advert's lifetime.
+/// On **macOS** (dev) the system responder (mDNSResponder) coexists with
+/// `mdns-sd` fine, so we keep the in-process path there. (The hub's
+/// `broadcast.rs` has the same latent issue when run on a Pi.)
+enum Advert {
+    // Held only to keep the daemon (and thus the advert) alive until drop; the
+    // field is never read, so suppress the dead-code lint on non-Linux builds.
+    #[cfg(not(target_os = "linux"))]
+    Mdns(#[allow(dead_code)] ServiceDaemon),
+    #[cfg(target_os = "linux")]
+    Avahi(std::process::Child),
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Advert {
+    fn drop(&mut self) {
+        let Advert::Avahi(child) = self;
+        // Stop the avahi registration (the advert is withdrawn when the client
+        // process exits). Best-effort: a reaped child just means it already ended.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Advertise the dongle as `_audioshare-dongle._tcp` carrying its id and name in
+/// TXT so the app can list it before assignment. See [`Advert`] for why the
+/// implementation differs by OS.
+fn advertise(identity: &Identity) -> Result<Advert, Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(target_os = "linux")]
+    {
+        advertise_avahi(identity)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        advertise_mdns(identity)
+    }
+}
+
+/// Linux: publish through the system avahi daemon. Runs unprivileged (avahi is a
+/// D-Bus client); requires `avahi-utils` (`avahi-publish-service`) installed.
+#[cfg(target_os = "linux")]
+fn advertise_avahi(identity: &Identity) -> Result<Advert, Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    // avahi wants the bare service type (`_audioshare-dongle._tcp`), not the
+    // `mdns-sd`-style `….local.` form the shared constant carries.
+    let service_type = DONGLE_MDNS_SERVICE_TYPE.trim_end_matches(".local.");
+
+    let mut command = Command::new("avahi-publish-service");
+    command
+        // Instance name the app sees in the browse list, then type, port, TXT.
+        .arg(&identity.name)
+        .arg(service_type)
+        .arg(DONGLE_ASSIGNMENT_PORT.to_string())
+        .arg(format!("id={}", identity.id))
+        .arg(format!("name={}", identity.name))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    // Backstop against orphaned adverts. The `Advert` `Drop` impl withdraws the
+    // advert on a *graceful* shutdown, but the agent is normally stopped by a
+    // signal (Ctrl-C / `kill` / crash / SIGKILL), which ends the process without
+    // running destructors — leaving `avahi-publish-service` advertising forever,
+    // so the app keeps listing a dongle that isn't running. Ask the kernel to
+    // SIGTERM this child when its parent (the agent) dies by *any* means.
+    //
+    // SAFETY: the closure runs in the forked child before `exec` and calls only
+    // the async-signal-safe `prctl`.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = command.spawn().map_err(|e| {
+        format!("failed to spawn avahi-publish-service (is avahi-utils installed?): {e}")
+    })?;
+
+    Ok(Advert::Avahi(child))
+}
+
+/// Non-Linux (macOS dev): advertise in-process via `mdns-sd`.
+#[cfg(not(target_os = "linux"))]
+fn advertise_mdns(identity: &Identity) -> Result<Advert, Box<dyn std::error::Error + Send + Sync>> {
     let mdns = ServiceDaemon::new()?;
     let ip = local_ip()?.to_string();
     let host_name = format!("{ip}.local.");
@@ -118,7 +216,7 @@ fn advertise(identity: &Identity) -> Result<ServiceDaemon, Box<dyn std::error::E
     )?;
 
     mdns.register(service)?;
-    Ok(mdns)
+    Ok(Advert::Mdns(mdns))
 }
 
 #[cfg(test)]
