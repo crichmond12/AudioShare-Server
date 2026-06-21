@@ -110,7 +110,7 @@ impl Engine {
             snapserver: Mutex::new(None),
             // I/O-free: the FIFO is opened lazily on first write once snapserver
             // is reading it (see `SnapcastSink`).
-            snapcast_sink: Arc::new(SnapcastSink::new(snapcast::DEFAULT_FIFO_PATH)),
+            snapcast_sink: Arc::new(SnapcastSink::new(snapcast::fifo_path(0))),
         }
     }
 
@@ -216,7 +216,7 @@ impl Engine {
             .lock()
             .expect("engine snapserver mutex poisoned");
         if guard.is_none() {
-            *guard = Some(SnapserverSupervisor::spawn()?);
+            *guard = Some(SnapserverSupervisor::spawn(1)?);
         }
         Ok(())
     }

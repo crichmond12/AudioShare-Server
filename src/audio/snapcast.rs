@@ -43,9 +43,23 @@ const SNAPCAST_CHANNELS: u16 = 2;
 /// `snapserver`'s `sampleformat` string for the above (`rate:bits:channels`).
 const SNAPCAST_SAMPLE_FORMAT: &str = "48000:16:2";
 
-/// Default path for the FIFO snapserver reads and the sink writes. snapserver
-/// owns it (created via `mode=create`); the sink is just the writer.
-pub const DEFAULT_FIFO_PATH: &str = "/tmp/audioshare-snapfifo";
+/// Base path for the per-stream FIFOs snapserver reads. Each pool stream `k`
+/// reads `audioshare-snapfifo-{k}`.
+const FIFO_PATH_BASE: &str = "/tmp/audioshare-snapfifo";
+
+/// Path of the FIFO backing pool stream `index`.
+pub fn fifo_path(index: usize) -> PathBuf {
+    PathBuf::from(format!("{FIFO_PATH_BASE}-{index}"))
+}
+
+/// snapserver stream name for pool stream `index` (the `stream_id` the control
+/// API addresses, e.g. for `Group.SetStream`).
+pub fn stream_id(index: usize) -> String {
+    format!("as-{index}")
+}
+
+/// Kept for the ignored single-stream smoke test: stream 0's FIFO.
+pub const DEFAULT_FIFO_PATH: &str = "/tmp/audioshare-snapfifo-0";
 
 /// How long the supervisor waits before relaunching a `snapserver` that exited.
 const SNAPSERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
@@ -182,14 +196,14 @@ fn to_i16le(samples: &[f32], out: &mut Vec<u8>) {
     }
 }
 
-/// Supervises a `snapserver` process configured with a single pipe stream that
-/// reads [`SnapcastSink`]'s FIFO.
+/// Supervises a `snapserver` process configured with N pipe streams that
+/// read [`SnapcastSink`]'s FIFOs.
 ///
 /// The plan keeps Snapcast a swappable implementation detail, so this stays a
 /// thin supervisor: it spawns `snapserver`, relaunches it if it exits, and kills
 /// it on drop. It does **not** speak snapserver's JSON-RPC API — hub-driven
-/// group/stream programming is a later sub-step. For sub-step 1 the static
-/// single-stream config is all that's needed to prove the audio + sync path.
+/// group/stream programming is a later sub-step. Each pool stream `k` reads
+/// its own FIFO at [`fifo_path`]`(k)` and is named [`stream_id`]`(k)`.
 pub struct SnapserverSupervisor {
     stop: Arc<AtomicBool>,
     /// Shared so [`Drop`] can kill the live child immediately rather than wait
@@ -199,27 +213,18 @@ pub struct SnapserverSupervisor {
 }
 
 impl SnapserverSupervisor {
-    /// Spawn `snapserver` (resolved from `PATH`) reading the FIFO at
-    /// [`DEFAULT_FIFO_PATH`]. See [`spawn_with`](Self::spawn_with) to override.
-    pub fn spawn() -> Result<Self, String> {
-        Self::spawn_with("snapserver", DEFAULT_FIFO_PATH)
+    /// Spawn `snapserver` (resolved from `PATH`) with `stream_count` pipe streams
+    /// `as-0..as-(stream_count-1)`, each reading its own FIFO.
+    pub fn spawn(stream_count: usize) -> Result<Self, String> {
+        Self::spawn_with("snapserver", stream_count)
     }
 
-    /// Spawn `binary` as the snapserver, configured with one pipe stream named
-    /// `AudioShare` reading `fifo_path` (which snapserver creates via
-    /// `mode=create`). Returns an error only if the *first* launch fails to
-    /// spawn — later crashes are handled by the restart loop.
-    pub fn spawn_with(
-        binary: impl Into<String>,
-        fifo_path: impl Into<PathBuf>,
-    ) -> Result<Self, String> {
+    /// Like [`spawn`](Self::spawn) but with an explicit binary (for tests/dev).
+    pub fn spawn_with(binary: impl Into<String>, stream_count: usize) -> Result<Self, String> {
         let binary = binary.into();
-        let fifo_path = fifo_path.into();
-        let source = pipe_source(&fifo_path);
+        let sources: Vec<String> = (0..stream_count).map(pipe_source).collect();
 
-        // Launch once up front so a misconfiguration (missing binary) surfaces
-        // to the caller instead of being silently retried forever.
-        let first = spawn_snapserver(&binary, &source)?;
+        let first = spawn_snapserver(&binary, &sources)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let child = Arc::new(Mutex::new(Some(first)));
@@ -227,17 +232,15 @@ impl SnapserverSupervisor {
         let monitor = {
             let stop = Arc::clone(&stop);
             let child = Arc::clone(&child);
+            let binary = binary.clone();
+            let sources = sources.clone();
             thread::Builder::new()
                 .name("snapserver-supervisor".to_string())
-                .spawn(move || monitor_loop(&binary, &source, &stop, &child))
+                .spawn(move || monitor_loop(&binary, &sources, &stop, &child))
                 .map_err(|e| format!("failed to spawn snapserver supervisor thread: {e}"))?
         };
 
-        Ok(Self {
-            stop,
-            child,
-            monitor: Some(monitor),
-        })
+        Ok(Self { stop, child, monitor: Some(monitor) })
     }
 }
 
@@ -265,7 +268,7 @@ impl Drop for SnapserverSupervisor {
 /// it after a short delay if it exits.
 fn monitor_loop(
     binary: &str,
-    source: &str,
+    sources: &[String],
     stop: &AtomicBool,
     child: &Mutex<Option<Child>>,
 ) {
@@ -286,7 +289,7 @@ fn monitor_loop(
             return;
         }
 
-        match spawn_snapserver(binary, source) {
+        match spawn_snapserver(binary, sources) {
             Ok(next) => *child.lock().expect("snapserver child mutex poisoned") = Some(next),
             Err(e) => {
                 eprintln!("snapserver relaunch failed: {e}");
@@ -296,23 +299,24 @@ fn monitor_loop(
     }
 }
 
-/// Build the `snapserver` pipe-stream source URI for `fifo_path`: a PCM pipe
-/// stream named `AudioShare` at the canonical sample format, with snapserver
-/// owning (creating) the FIFO.
-fn pipe_source(fifo_path: &Path) -> String {
+/// Build the `snapserver` pipe-stream source URI for pool stream `index`.
+fn pipe_source(index: usize) -> String {
     format!(
-        "pipe://{}?name=AudioShare&mode=create&sampleformat={}&codec=pcm",
-        fifo_path.display(),
+        "pipe://{}?name={}&mode=create&sampleformat={}&codec=pcm",
+        fifo_path(index).display(),
+        stream_id(index),
         SNAPCAST_SAMPLE_FORMAT
     )
 }
 
-/// Spawn one `snapserver` process with the given stream source.
-fn spawn_snapserver(binary: &str, source: &str) -> Result<Child, String> {
-    Command::new(binary)
-        .arg("--stream.source")
-        .arg(source)
-        .stdin(Stdio::null())
+/// Spawn one `snapserver` process with the given stream sources (one
+/// `--stream.source` arg per entry).
+fn spawn_snapserver(binary: &str, sources: &[String]) -> Result<Child, String> {
+    let mut cmd = Command::new(binary);
+    for source in sources {
+        cmd.arg("--stream.source").arg(source);
+    }
+    cmd.stdin(Stdio::null())
         .spawn()
         .map_err(|e| format!("failed to spawn snapserver `{binary}`: {e}"))
 }
@@ -364,8 +368,26 @@ mod tests {
 
     #[test]
     fn pipe_source_encodes_format_and_create_mode() {
-        let source = pipe_source(Path::new("/tmp/snapfifo"));
-        assert!(source.contains("pipe:///tmp/snapfifo"));
+        let source = pipe_source(0);
+        assert!(source.contains("pipe:///tmp/audioshare-snapfifo-0"));
+        assert!(source.contains("mode=create"));
+        assert!(source.contains("sampleformat=48000:16:2"));
+        assert!(source.contains("codec=pcm"));
+    }
+
+    #[test]
+    fn fifo_and_stream_ids_are_indexed() {
+        assert_eq!(fifo_path(0), std::path::PathBuf::from("/tmp/audioshare-snapfifo-0"));
+        assert_eq!(fifo_path(7), std::path::PathBuf::from("/tmp/audioshare-snapfifo-7"));
+        assert_eq!(stream_id(0), "as-0");
+        assert_eq!(stream_id(7), "as-7");
+    }
+
+    #[test]
+    fn pipe_source_names_the_indexed_stream() {
+        let source = pipe_source(3);
+        assert!(source.contains("pipe:///tmp/audioshare-snapfifo-3"), "{source}");
+        assert!(source.contains("name=as-3"), "{source}");
         assert!(source.contains("mode=create"));
         assert!(source.contains("sampleformat=48000:16:2"));
         assert!(source.contains("codec=pcm"));
@@ -489,11 +511,11 @@ mod tests {
         const URL: &str = "https://ice1.somafm.com/groovesalad-128-mp3";
 
         let _server =
-            SnapserverSupervisor::spawn().expect("snapserver should spawn (is it installed?)");
+            SnapserverSupervisor::spawn(1).expect("snapserver should spawn (is it installed?)");
         // Give snapserver a moment to create the FIFO and open the read end.
         thread::sleep(Duration::from_secs(1));
 
-        let sink = SnapcastSink::new(DEFAULT_FIFO_PATH);
+        let sink = SnapcastSink::new(fifo_path(0));
         let stop = Arc::new(AtomicBool::new(false));
 
         let stop_for_thread = Arc::clone(&stop);
