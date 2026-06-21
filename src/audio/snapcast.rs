@@ -22,7 +22,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +46,9 @@ const SNAPCAST_SAMPLE_FORMAT: &str = "48000:16:2";
 /// reads `audioshare-snapfifo-{k}`.
 const FIFO_PATH_BASE: &str = "/tmp/audioshare-snapfifo";
 
+/// Path of the snapserver config file the supervisor writes and launches with.
+const CONFIG_PATH: &str = "/tmp/audioshare-snapserver.conf";
+
 /// Path of the FIFO backing pool stream `index`.
 pub fn fifo_path(index: usize) -> PathBuf {
     PathBuf::from(format!("{FIFO_PATH_BASE}-{index}"))
@@ -67,15 +69,18 @@ const SNAPSERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// An [`AudioSink`] that writes a zone's PCM into a `snapserver` input FIFO.
 ///
 /// The decode pipeline writes interleaved `f32`; this converts each sample to
-/// `s16le` and writes it to the FIFO. The FIFO write end is opened lazily and
-/// non-blocking: until `snapserver` has the read end open the open fails with
-/// `ENXIO`, so we simply drop that buffer and retry on the next `write` (the
-/// decode thread never blocks on snapserver coming up). Once the open succeeds
-/// (reader present), `O_NONBLOCK` is cleared so subsequent writes **block**
-/// instead of dropping — this is the natural backpressure that paces the decode
-/// thread and prevents the KAN-23 Snapcast-variant choppiness. If the reader
-/// later vanishes, a blocking write returns `EPIPE`; the handle is dropped so
-/// the next `write` reopens it.
+/// `s16le` and writes it to the FIFO. The FIFO write end is opened lazily on the
+/// first `write` with a **blocking** open: it returns the moment `snapserver`
+/// next opens the read end, then we hold that writer for the rest of playback and
+/// subsequent writes **block** — the natural backpressure that paces the decode
+/// thread instead of dropping on a full pipe (KAN-23 Snapcast-variant
+/// choppiness). A blocking open (rather than the previous `O_NONBLOCK` one)
+/// avoids a cold-start livelock: a non-blocking open returns `ENXIO` whenever
+/// `snapserver`'s read end is momentarily closed (it cycles while it has no
+/// writer), and the two ends polling independently could miss each other for many
+/// seconds — every decoded buffer dropped — so the first play made no sound. If
+/// the reader later vanishes, a blocking write returns `EPIPE`; the handle is
+/// dropped so the next `write` reopens it.
 pub struct SnapcastSink {
     fifo_path: PathBuf,
     inner: Mutex<Inner>,
@@ -114,18 +119,13 @@ impl AudioSink for SnapcastSink {
     fn write(&self, samples: &[f32]) {
         let inner = &mut *self.inner.lock().expect("snapcast sink mutex poisoned");
 
-        // Lazily (re)open the FIFO write end. ENXIO ("no reader") means
-        // snapserver isn't up yet — drop this buffer and try again next time.
+        // Lazily (re)open the FIFO write end. The blocking open returns once
+        // snapserver is reading, so a reader is present and subsequent writes
+        // block (backpressure). A non-open error (e.g. the FIFO path vanished)
+        // means drop this buffer and retry next time.
         if inner.writer.is_none() {
             match open_fifo_write(&self.fifo_path) {
-                Ok(file) => {
-                    // Reader is present (open succeeded): switch to blocking so
-                    // writes pace the decode thread instead of dropping overflow.
-                    if clear_nonblocking(&file).is_err() {
-                        return;
-                    }
-                    inner.writer = Some(file);
-                }
+                Ok(file) => inner.writer = Some(file),
                 Err(_) => return,
             }
         }
@@ -139,8 +139,8 @@ impl AudioSink for SnapcastSink {
         };
         match file.write(&inner.scratch) {
             Ok(_) => {}
-            // WouldBlock should not occur once O_NONBLOCK is cleared (blocking
-            // writes block instead of returning EAGAIN); kept as a safe fallback.
+            // WouldBlock should not occur on a blocking writer (writes block
+            // instead of returning EAGAIN); kept as a safe fallback.
             Err(e) if e.kind() == ErrorKind::WouldBlock => {}
             // Reader gone / broken pipe: drop the handle and reopen next write.
             Err(_) => inner.writer = None,
@@ -148,40 +148,21 @@ impl AudioSink for SnapcastSink {
     }
 }
 
-/// Open the write end of an existing FIFO without blocking on a reader.
+/// Open the write end of an existing FIFO, **blocking** until a reader is present.
 ///
-/// A blocking open of a FIFO for writing waits until a reader appears; with
-/// `O_NONBLOCK` it instead returns `ENXIO` immediately when there is no reader,
-/// which lets the sink poll for snapserver coming up instead of stalling the
-/// decode thread.
+/// A blocking FIFO open for writing returns the moment `snapserver` next opens the
+/// read end, and we then hold that writer open for the rest of playback. This is
+/// deliberate: the earlier `O_NONBLOCK` open returned `ENXIO` whenever
+/// `snapserver`'s read end was momentarily closed (it cycles open/closed while it
+/// has no writer), and the sink dropped that buffer and retried on the next write.
+/// Because both ends polled independently they could *miss each other for many
+/// seconds* — every decoded buffer dropped — so the first play after a fresh
+/// `snapclient` connection produced no sound until the race happened to resolve.
+/// Blocking the open removes the race: the kernel pairs the two ends as soon as
+/// `snapserver` reads, bounded by its reopen interval (sub-second) rather than an
+/// unbounded livelock.
 fn open_fifo_write(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-}
-
-/// Clear `O_NONBLOCK` on an open FIFO writer so subsequent writes block.
-///
-/// We open the FIFO non-blocking (so the open returns `ENXIO` instead of
-/// stalling when `snapserver` isn't reading yet). Once the open *succeeds* a
-/// reader is present, and a **blocking** write is the natural backpressure that
-/// paces the decode thread — far better than dropping on a full pipe, which
-/// causes the KAN-23 Snapcast-variant choppiness. If the reader later vanishes a
-/// blocking write returns `EPIPE` (Rust ignores `SIGPIPE`), which the caller
-/// already handles by dropping the handle.
-fn clear_nonblocking(file: &File) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
-    if res < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    OpenOptions::new().write(true).open(path)
 }
 
 /// Convert interleaved `f32` samples in `[-1.0, 1.0]` to little-endian `s16`,
@@ -200,10 +181,15 @@ fn to_i16le(samples: &[f32], out: &mut Vec<u8>) {
 /// read [`SnapcastSink`]'s FIFOs.
 ///
 /// The plan keeps Snapcast a swappable implementation detail, so this stays a
-/// thin supervisor: it spawns `snapserver`, relaunches it if it exits, and kills
-/// it on drop. It does **not** speak snapserver's JSON-RPC API — hub-driven
-/// group/stream programming is a later sub-step. Each pool stream `k` reads
-/// its own FIFO at [`fifo_path`]`(k)` and is named [`stream_id`]`(k)`.
+/// thin supervisor: it writes a minimal config file declaring the streams,
+/// launches `snapserver -c <config>`, relaunches it if it exits, and kills it on
+/// drop. (snapserver 0.35 builds its stream list only from the config file's
+/// `[stream] source` entries — `--stream.source` on the CLI is ignored, so a
+/// flag-only launch silently falls back to snapserver's built-in `default`
+/// stream and our FIFO goes unread.) It does **not** speak snapserver's JSON-RPC
+/// API — hub-driven group/stream programming is a later sub-step. Each pool
+/// stream `k` reads its own FIFO at [`fifo_path`]`(k)` and is named
+/// [`stream_id`]`(k)`.
 pub struct SnapserverSupervisor {
     stop: Arc<AtomicBool>,
     /// Shared so [`Drop`] can kill the live child immediately rather than wait
@@ -224,7 +210,12 @@ impl SnapserverSupervisor {
         let binary = binary.into();
         let sources: Vec<String> = (0..stream_count).map(pipe_source).collect();
 
-        let first = spawn_snapserver(&binary, &sources)?;
+        // snapserver 0.35 takes its stream list from the config file, not the
+        // `--stream.source` CLI flag, so write a minimal config and launch with
+        // `-c`. This also omits snapserver's built-in `default` stream.
+        let config_path = write_config(&sources)?;
+
+        let first = spawn_snapserver(&binary, &config_path)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let child = Arc::new(Mutex::new(Some(first)));
@@ -233,10 +224,10 @@ impl SnapserverSupervisor {
             let stop = Arc::clone(&stop);
             let child = Arc::clone(&child);
             let binary = binary.clone();
-            let sources = sources.clone();
+            let config_path = config_path.clone();
             thread::Builder::new()
                 .name("snapserver-supervisor".to_string())
-                .spawn(move || monitor_loop(&binary, &sources, &stop, &child))
+                .spawn(move || monitor_loop(&binary, &config_path, &stop, &child))
                 .map_err(|e| format!("failed to spawn snapserver supervisor thread: {e}"))?
         };
 
@@ -268,7 +259,7 @@ impl Drop for SnapserverSupervisor {
 /// it after a short delay if it exits.
 fn monitor_loop(
     binary: &str,
-    sources: &[String],
+    config_path: &Path,
     stop: &AtomicBool,
     child: &Mutex<Option<Child>>,
 ) {
@@ -289,7 +280,7 @@ fn monitor_loop(
             return;
         }
 
-        match spawn_snapserver(binary, sources) {
+        match spawn_snapserver(binary, config_path) {
             Ok(next) => *child.lock().expect("snapserver child mutex poisoned") = Some(next),
             Err(e) => {
                 eprintln!("snapserver relaunch failed: {e}");
@@ -309,14 +300,38 @@ fn pipe_source(index: usize) -> String {
     )
 }
 
-/// Spawn one `snapserver` process with the given stream sources (one
-/// `--stream.source` arg per entry).
-fn spawn_snapserver(binary: &str, sources: &[String]) -> Result<Child, String> {
-    let mut cmd = Command::new(binary);
+/// Build the snapserver config-file body declaring one pipe stream per source.
+///
+/// snapserver 0.35 populates its stream list only from the `[stream] source`
+/// entries here — `source` is a repeatable directive the `--stream.source` CLI
+/// override doesn't feed — so this config file is the supported way to configure
+/// streams. Declaring our sources also suppresses snapserver's built-in
+/// `default` stream, which a source-less launch falls back to (and which a fresh
+/// `snapclient` would otherwise land on, hearing silence).
+fn snapserver_config(sources: &[String]) -> String {
+    let mut cfg = String::from("[stream]\n");
     for source in sources {
-        cmd.arg("--stream.source").arg(source);
+        cfg.push_str("source = ");
+        cfg.push_str(source);
+        cfg.push('\n');
     }
-    cmd.stdin(Stdio::null())
+    cfg
+}
+
+/// Write the snapserver config to [`CONFIG_PATH`] and return its path.
+fn write_config(sources: &[String]) -> Result<PathBuf, String> {
+    let path = PathBuf::from(CONFIG_PATH);
+    std::fs::write(&path, snapserver_config(sources))
+        .map_err(|e| format!("failed to write snapserver config {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Spawn one `snapserver` process configured by the file at `config_path`.
+fn spawn_snapserver(binary: &str, config_path: &Path) -> Result<Child, String> {
+    Command::new(binary)
+        .arg("-c")
+        .arg(config_path)
+        .stdin(Stdio::null())
         .spawn()
         .map_err(|e| format!("failed to spawn snapserver `{binary}`: {e}"))
 }
@@ -381,6 +396,26 @@ mod tests {
         assert_eq!(fifo_path(7), std::path::PathBuf::from("/tmp/audioshare-snapfifo-7"));
         assert_eq!(stream_id(0), "as-0");
         assert_eq!(stream_id(7), "as-7");
+    }
+
+    #[test]
+    fn config_declares_a_source_per_stream_and_no_default() {
+        let sources = vec![pipe_source(0), pipe_source(1)];
+        let cfg = snapserver_config(&sources);
+
+        assert!(cfg.contains("[stream]"), "{cfg}");
+        assert!(
+            cfg.contains("source = pipe:///tmp/audioshare-snapfifo-0?name=as-0"),
+            "{cfg}"
+        );
+        assert!(
+            cfg.contains("source = pipe:///tmp/audioshare-snapfifo-1?name=as-1"),
+            "{cfg}"
+        );
+        // One source line per stream and no built-in `default` /tmp/snapfifo
+        // stream (which a source-less snapserver launch falls back to).
+        assert_eq!(cfg.matches("source = ").count(), 2);
+        assert!(!cfg.contains("/tmp/snapfifo?"), "{cfg}");
     }
 
     #[test]
