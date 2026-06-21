@@ -6,11 +6,16 @@
 //! reconciles `snapserver`'s groups/streams to the hub's desired topology over
 //! the control API. See `docs/multi-room-plan.md` Change 5 sub-step 3.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::audio::sink::AudioSink;
 use crate::audio::snapcast::{fifo_path, stream_id, SnapcastSink};
-use crate::audio::snapcast_control::SnapcastControl;
+use crate::audio::snapcast_control::{CommandConn, EventListener, SnapcastControl};
+
+/// Host snapserver's control API listens on (local to the hub).
+const CONTROL_HOST: &str = "127.0.0.1";
+const CONTROL_PORT: u16 = 1705;
 
 /// Concurrent *playing* zones the hub supports (the snapserver stream pool size).
 /// Creating zones is unbounded; only playback consumes a slot.
@@ -110,6 +115,144 @@ pub fn reconcile(control: &dyn SnapcastControl, entries: &[ZoneRouting]) -> Resu
         control.set_group_stream(group, &entry.stream_id)?;
     }
     Ok(())
+}
+
+/// The engine's single seam into Snapcast: owns the supervised snapserver, the
+/// stream pool, the control connection + event listener, and the desired routing
+/// the reconciler converges snapserver to.
+pub struct SnapcastRouter {
+    started: Mutex<Option<Started>>,
+    pool: Mutex<StreamPool>,
+    /// zone -> dongle client ids that should be grouped on the zone's stream.
+    desired: Mutex<HashMap<String, Vec<String>>>,
+}
+
+/// The running side, created lazily on the first `sink_for_zone`.
+struct Started {
+    _supervisor: crate::audio::snapcast::SnapserverSupervisor,
+    control: Arc<dyn SnapcastControl>,
+    _events: EventListener,
+}
+
+impl SnapcastRouter {
+    pub fn new() -> Self {
+        Self {
+            started: Mutex::new(None),
+            pool: Mutex::new(StreamPool::new(STREAM_POOL_SIZE)),
+            desired: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Allocate a stream for `zone`, record its desired grouping, kick a
+    /// reconcile, and return the sink to decode into. Lazily starts snapserver +
+    /// control on first use. Errors with `no_free_stream` when the pool is full.
+    pub fn sink_for_zone(
+        &self,
+        zone: &str,
+        dongle_ids: &[String],
+    ) -> Result<Arc<dyn AudioSink>, String> {
+        #[cfg(not(test))]
+        self.ensure_started()?;
+
+        let allocated = {
+            let mut pool = self.pool.lock().expect("stream pool mutex poisoned");
+            pool.allocate(zone)
+                .ok_or_else(|| "no_free_stream".to_string())?
+        };
+
+        self.desired
+            .lock()
+            .expect("desired mutex poisoned")
+            .insert(zone.to_string(), dongle_ids.to_vec());
+
+        self.reconcile_now();
+        Ok(allocated.sink)
+    }
+
+    /// Free `zone`'s stream and drop its desired routing.
+    pub fn release_zone(&self, zone: &str) {
+        self.pool
+            .lock()
+            .expect("stream pool mutex poisoned")
+            .release(zone);
+        self.desired
+            .lock()
+            .expect("desired mutex poisoned")
+            .remove(zone);
+    }
+
+    /// Build current desired routing from desired state + pool, and reconcile
+    /// snapserver to it. Safe to call from the event listener thread.
+    pub fn reconcile_now(&self) {
+        let control = {
+            let guard = self.started.lock().expect("started mutex poisoned");
+            match guard.as_ref() {
+                Some(s) => Arc::clone(&s.control),
+                None => return,
+            }
+        };
+        let entries = self.entries();
+        if let Err(e) = reconcile(control.as_ref(), &entries) {
+            eprintln!("snapcast reconcile failed (will retry on next trigger): {e}");
+        }
+    }
+
+    fn entries(&self) -> Vec<ZoneRouting> {
+        let desired = self.desired.lock().expect("desired mutex poisoned");
+        let pool = self.pool.lock().expect("stream pool mutex poisoned");
+        desired
+            .iter()
+            .filter_map(|(zone, clients)| {
+                pool.stream_for(zone).map(|stream_id| ZoneRouting {
+                    stream_id,
+                    clients: clients.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Spawn snapserver + open the control connection + start the event listener,
+    /// once. Idempotent.
+    fn ensure_started(&self) -> Result<(), String> {
+        let mut guard = self.started.lock().expect("started mutex poisoned");
+        if guard.is_some() {
+            return Ok(());
+        }
+        let supervisor =
+            crate::audio::snapcast::SnapserverSupervisor::spawn(STREAM_POOL_SIZE)?;
+        // Give snapserver a moment to bind its control port before connecting.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let control: Arc<dyn SnapcastControl> =
+            Arc::new(CommandConn::connect(CONTROL_HOST, CONTROL_PORT)?);
+        let events = EventListener::spawn(CONTROL_HOST, CONTROL_PORT, || {
+            crate::audio::engine::ENGINE.snapcast_on_notify();
+        })?;
+        *guard = Some(Started {
+            _supervisor: supervisor,
+            control,
+            _events: events,
+        });
+        Ok(())
+    }
+}
+
+impl Default for SnapcastRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl SnapcastRouter {
+    /// A router that behaves as "started" with no real snapserver/control, so
+    /// allocation + desired bookkeeping are exercised device-free.
+    fn for_test() -> Self {
+        Self::new()
+    }
+
+    fn desired_routing_for_test(&self) -> Vec<ZoneRouting> {
+        self.entries()
+    }
 }
 
 #[cfg(test)]
@@ -223,5 +366,25 @@ mod tests {
         reconcile(&control, &entries).expect("reconcile");
         assert!(control.set_clients.lock().unwrap().is_empty());
         assert!(control.set_stream.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn router_allocates_and_records_desired_routing() {
+        // Test-only: a router whose snapserver/control are considered "absent" so
+        // sink_for_zone allocates + records desired state without real I/O.
+        let router = SnapcastRouter::for_test();
+
+        let sink = router
+            .sink_for_zone("kitchen", &["d1".to_string(), "d2".to_string()])
+            .expect("alloc");
+        assert_eq!(sink.sample_rate(), 48_000);
+
+        let routing = router.desired_routing_for_test();
+        assert_eq!(routing.len(), 1);
+        assert_eq!(routing[0].clients, vec!["d1".to_string(), "d2".to_string()]);
+        assert!(routing[0].stream_id.starts_with("as-"));
+
+        router.release_zone("kitchen");
+        assert!(router.desired_routing_for_test().is_empty());
     }
 }

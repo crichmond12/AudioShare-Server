@@ -291,6 +291,11 @@ impl Engine {
         self.registry.set_online(id, false);
         self.notify_outputs_changed();
     }
+
+    /// Re-run Snapcast reconcile (fired by snapserver client-connect events).
+    /// Bridge stub wired to the router in sub-step 3.4 Task 8; intentionally a
+    /// no-op until the engine owns the SnapcastRouter.
+    pub fn snapcast_on_notify(&self) {}
 }
 
 impl Default for Engine {
