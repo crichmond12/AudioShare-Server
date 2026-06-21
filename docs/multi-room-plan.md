@@ -438,9 +438,60 @@ all of them until sub-step 3. Comment this loudly so it isn't mistaken for a bug
     handling is testable with a mock.
   - **Still deferred to later sub-steps:** auth on the dongle channel; iOS
     scan-and-assign (2.5); hub-driven per-dongle grouping (sub-step 3).
-- **2.5** iOS app: scan `_audioshare-dongle._tcp`, assign to the current hub —
-  **cross-project**, mirrored in `~/Documents/Audio Share/`. Sequenced after the
-  headless hub+agent path works.
+- **2.5** ✅ **Landed (iOS side).** iOS app: scan `_audioshare-dongle._tcp`,
+  assign to the current hub — **cross-project**, in `~/Documents/Audio Share/`.
+  Three new files: `Managers/DongleDiscoveryManager.swift` (an `NWBrowser` +
+  `NetService` browse of `_audioshare-dongle._tcp`, parallel to the hub's
+  `ServiceDiscoveryManager`; resolves each dongle's TXT `id`/`name` + IPv4 into a
+  published `[DiscoveredDongle]`, upserted by `id`, pruned as adverts leave),
+  `Managers/DongleAssignmentManager.swift` (speaks the agent's assignment
+  handshake — connects to the dongle's listener on `DONGLE_ASSIGNMENT_PORT`
+  (50507), sends one newline-delimited `AppToDongle::Assign { hub_host, hub_port
+  = HUB_REGISTRATION_PORT 50506 }`, awaits `DongleToApp::Assigned { dongle_id }`;
+  `hub_host` is the hub IP the app is paired to via
+  `ConnectionManager.getLocalServerIPAddress()`), and
+  `Controllers/Library/DongleListView.swift` (a `List` of discovered dongles with
+  a per-row "Add to this hub" button + status, reachable from `Library` via a
+  `NavigationLink` "Add a Speaker"). The assignment wire types mirror
+  `audioshare_protocol`'s `AppToDongle`/`DongleToApp` (tagged JSON, `type` field)
+  — the shared-crate discipline doesn't cover the iOS client, so this is the
+  hand-mirrored boundary to keep in sync. Replaces the free-text Zone field's job
+  of *finding* a dongle (the field stays as the way to *target* one until a
+  playback picker lands). Not built: auth on the assignment/registration channels;
+  hub-driven per-dongle grouping (sub-step 3). **Untested on-device** — the dev
+  box has only Command Line Tools (no `xcodebuild`); needs a build + a real
+  agent on the LAN to verify the browse + handshake.
+
+#### Bring-up note — the dongle agent's mDNS advert is invisible on macOS (2026-06-20)
+
+Running the dongle agent on a **Mac** for dev, its mDNS advert
+(`_audioshare-dongle._tcp` via the pure-Rust `mdns-sd` crate) is **not
+discoverable** by `dns-sd` or the iOS app, even though the agent logs
+"Unassigned. Advertising as …". Cause: macOS already runs Apple's
+`mDNSResponder` (and often a second responder — Chrome/Google was holding UDP
+5353 here), which is what `dns-sd` and iOS `NWBrowser` query; the `mdns-sd`
+crate runs its **own** responder and its records never reach Apple's. The hub's
+advert works only because the hub runs on **Linux**, where `mdns-sd` owns the
+mDNS stack. Confirmed: `dns-sd -B _audioshare._tcp` lists the (Linux) hub but
+`dns-sd -B _audioshare-dongle._tcp` lists nothing while the Mac agent runs.
+
+This is a **macOS-as-dongle dev artifact, not a protocol/app bug** — production
+dongles are Linux SBCs where discovery works (same as the hub). Two ways to test
+the iOS sub-step 2.5 path regardless:
+- **Real verification:** run the agent on a Pi/Linux box; the iPhone discovers it
+  natively, no shim.
+- **Mac dev shim:** advertise the service through Apple's responder while the
+  *real* agent still handles the TCP assignment on 50507 —
+  `dns-sd -R "<name>" _audioshare-dongle._tcp local 50507 id=<agent's real uuid> name="<name>"`
+  (keep it running). The app then discovers via Apple's advert, resolves the
+  TXT `id`/`name` + the Mac's IP, and connects to 50507 (the agent), which
+  receives `Assign`, persists, acks, and registers with the hub. The `id` TXT
+  **must** be the agent's persisted UUID so the hub registers the output/zone
+  under the id playback will target.
+
+(If macOS dongle discovery ever needs to work natively, the agent would have to
+advertise via Apple's `dns_sd` C API on macOS instead of `mdns-sd` — not worth
+it for a Linux-only production target.)
 
 #### Bring-up notes (first real laptop-as-dongle demo, 2026-06-20)
 
@@ -484,6 +535,37 @@ doesn't rediscover them:
    `O_NONBLOCK` via `fcntl`), or feed snapserver through a paced ring buffer. This
    is the Snapcast-path sibling of the local-output prebuffering already done in
    commit 550a50d; the local fix doesn't cover this sink.
+
+#### Bring-up notes (Pi-hub → Pi-dongle, cold-start race fixed, 2026-06-21)
+
+Full path proven again (macOS hub → Pi dongle agent → `snapclient` → speaker).
+Registration was clean once both ends ran current binaries; the only hard failure
+was the **first play producing no sound**.
+
+5. **Cold-start race — fixed (commit 9c70373).** `SnapcastSink::open_fifo_write`
+   opened the FIFO `O_NONBLOCK`, which returns `ENXIO` whenever `snapserver`'s read
+   end is momentarily closed (it cycles open/closed while it has no writer). The
+   non-blocking writer and the polling reader missed each other and **every decoded
+   buffer was silently dropped** — measured 17s–2min before audio, past
+   `snapclient`'s 5s no-chunk timeout — so the first play after a fresh client
+   connection was silent until the race happened to resolve. Fix: open the FIFO
+   **blocking**; it returns the instant `snapserver` next opens the read end
+   (~80ms) and we then hold a persistent writer. (This supersedes the
+   "non-blocking open then `clear_nonblocking`" direction floated in note 4 above —
+   blocking from the open is simpler and removes the race.)
+
+**Open follow-ups (need to be taken care of — not yet done):**
+
+- **`snapclient` binds ALSA `sysdefault` despite the `-s default` arg.** The agent's
+  `SnapclientSupervisor` passes `-s default`, but `snapclient` still logs
+  `device: sysdefault`. It worked on the test Pi, but `sysdefault` is HDMI-only
+  card 0 on many Pis (ALSA error 524 with nothing plugged into HDMI), so this will
+  bite on other hardware. Verify the `-s` arg actually reaches `snapclient` and
+  resolves to the intended sink (`AUDIOSHARE_SOUND_DEVICE` override exists).
+- **Stale `connected:false` `snapclient` entries accumulate in `snapserver`.** Each
+  dongle reconnect (and any hostID change) leaves a ghost client in
+  `Server.GetStatus`; the list grows across runs. Cosmetic today, but should be
+  reaped / deduped before the iOS picker surfaces snapserver state directly.
 
 ---
 
