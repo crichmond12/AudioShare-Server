@@ -56,11 +56,12 @@ const SNAPSERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// `s16le` and writes it to the FIFO. The FIFO write end is opened lazily and
 /// non-blocking: until `snapserver` has the read end open the open fails with
 /// `ENXIO`, so we simply drop that buffer and retry on the next `write` (the
-/// decode thread never blocks on snapserver coming up). A full pipe buffer
-/// (`WouldBlock`) likewise drops the overflow — matching [`crate::audio::output`]'s
-/// "drop oldest on overrun" stance; proper jitter buffering remains KAN-23. Any
-/// other write error (e.g. the reader vanished on a snapserver restart) drops
-/// the handle so the next `write` reopens it.
+/// decode thread never blocks on snapserver coming up). Once the open succeeds
+/// (reader present), `O_NONBLOCK` is cleared so subsequent writes **block**
+/// instead of dropping — this is the natural backpressure that paces the decode
+/// thread and prevents the KAN-23 Snapcast-variant choppiness. If the reader
+/// later vanishes, a blocking write returns `EPIPE`; the handle is dropped so
+/// the next `write` reopens it.
 pub struct SnapcastSink {
     fifo_path: PathBuf,
     inner: Mutex<Inner>,
@@ -103,7 +104,14 @@ impl AudioSink for SnapcastSink {
         // snapserver isn't up yet — drop this buffer and try again next time.
         if inner.writer.is_none() {
             match open_fifo_write(&self.fifo_path) {
-                Ok(file) => inner.writer = Some(file),
+                Ok(file) => {
+                    // Reader is present (open succeeded): switch to blocking so
+                    // writes pace the decode thread instead of dropping overflow.
+                    if clear_nonblocking(&file).is_err() {
+                        return;
+                    }
+                    inner.writer = Some(file);
+                }
                 Err(_) => return,
             }
         }
@@ -116,9 +124,9 @@ impl AudioSink for SnapcastSink {
             return;
         };
         match file.write(&inner.scratch) {
-            // A short write means the pipe buffer filled; we drop the overflow
-            // rather than block the decode thread.
             Ok(_) => {}
+            // WouldBlock should not occur once O_NONBLOCK is cleared (blocking
+            // writes block instead of returning EAGAIN); kept as a safe fallback.
             Err(e) if e.kind() == ErrorKind::WouldBlock => {}
             // Reader gone / broken pipe: drop the handle and reopen next write.
             Err(_) => inner.writer = None,
@@ -137,6 +145,29 @@ fn open_fifo_write(path: &Path) -> std::io::Result<File> {
         .write(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
+}
+
+/// Clear `O_NONBLOCK` on an open FIFO writer so subsequent writes block.
+///
+/// We open the FIFO non-blocking (so the open returns `ENXIO` instead of
+/// stalling when `snapserver` isn't reading yet). Once the open *succeeds* a
+/// reader is present, and a **blocking** write is the natural backpressure that
+/// paces the decode thread — far better than dropping on a full pipe, which
+/// causes the KAN-23 Snapcast-variant choppiness. If the reader later vanishes a
+/// blocking write returns `EPIPE` (Rust ignores `SIGPIPE`), which the caller
+/// already handles by dropping the handle.
+fn clear_nonblocking(file: &File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    if res < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Convert interleaved `f32` samples in `[-1.0, 1.0]` to little-endian `s16`,
@@ -338,6 +369,109 @@ mod tests {
         assert!(source.contains("mode=create"));
         assert!(source.contains("sampleformat=48000:16:2"));
         assert!(source.contains("codec=pcm"));
+    }
+
+    #[test]
+    fn write_applies_backpressure_once_reader_present() {
+        use std::ffi::CString;
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::{Arc, Barrier};
+
+        // Unique FIFO path in the temp dir.
+        let path = std::env::temp_dir().join(format!("as-bp-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        // mkfifo(path, 0o600)
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo failed");
+
+        // Total bytes well past the 64 KiB pipe capacity, so a non-blocking
+        // dropping writer could not deliver all of them.
+        const TOTAL_SAMPLES: usize = 200_000; // -> 400_000 bytes of s16le
+        const TOTAL_BYTES: usize = TOTAL_SAMPLES * 2;
+
+        // FIFO open ordering on macOS/Linux:
+        //   open(O_RDONLY)          blocks until a writer appears
+        //   open(O_WRONLY|O_NONBLOCK) returns ENXIO if no reader is present
+        //   open(O_RDONLY|O_NONBLOCK) succeeds immediately (no writer needed)
+        //
+        // Strategy: two barriers.
+        //   barrier_a: reader signals "read end open" → main proceeds to open write end
+        //   barrier_b: main signals "write end open"  → reader starts reading
+        // This avoids deadlock (both parties open before either tries to read/write)
+        // and prevents a premature EOF (read() on a FIFO with no writer returns 0).
+        let barrier_a = Arc::new(Barrier::new(2)); // reader → main: read end is open
+        let barrier_b = Arc::new(Barrier::new(2)); // main → reader: write end is open
+
+        let reader_path = path.clone();
+        let ba = Arc::clone(&barrier_a);
+        let bb = Arc::clone(&barrier_b);
+        let reader = std::thread::spawn(move || {
+            // Open read end non-blocking (succeeds immediately on macOS/Linux).
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&reader_path)
+                .expect("open fifo for read");
+            // Signal the main thread: read end is open, proceed with write open.
+            ba.wait();
+            // Wait for the main thread to confirm the write end is open before
+            // reading — otherwise read() returns 0 (EOF: no writer).
+            bb.wait();
+            // Now that a writer is present, switch to blocking reads so the
+            // "slow reader" accurately represents real backpressure load.
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = f.as_raw_fd();
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+            }
+
+            // Drain the FIFO slowly (backpressure probe: a slow reader forces
+            // the writer to block once the pipe buffer fills).
+            // Sleep 5ms between reads: drain rate ≈ 4096 bytes / 5ms ≈ 800 KB/s.
+            // The writer produces 400 KB and runs at multi-MB/s, so without
+            // backpressure the pipe fills and non-blocking writes start dropping.
+            let mut got = 0usize;
+            let mut buf = [0u8; 4096];
+            while got < TOTAL_BYTES {
+                match (&f).read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        got += n;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            got
+        });
+
+        // Wait for the reader to open the read end, then open the write end.
+        barrier_a.wait();
+
+        let sink = SnapcastSink::new(&path);
+        // Trigger the lazy open of the write end with an empty write (no-op for
+        // the FIFO, but opens the fd so the reader can safely start reading).
+        sink.write(&[]);
+        // Signal the reader: write end is now open, reads will not return EOF.
+        barrier_b.wait();
+
+        // Write in chunks; with backpressure these block instead of dropping.
+        // Use a chunk size that divides TOTAL_SAMPLES exactly to avoid overshoot.
+        const CHUNK_SAMPLES: usize = 1_000; // 200_000 / 1_000 = 200 exact iterations
+        let chunk = vec![0.25f32; CHUNK_SAMPLES];
+        let mut written = 0usize;
+        while written < TOTAL_SAMPLES {
+            sink.write(&chunk);
+            written += chunk.len();
+        }
+        // Drop the sink to close the write end and signal EOF to the reader.
+        drop(sink);
+
+        let got = reader.join().expect("reader thread");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, TOTAL_BYTES, "reader must receive every byte (no drops)");
     }
 
     // Live end-to-end check (opt-in: needs the `snapserver`/`snapclient` binaries,
