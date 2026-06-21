@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::audio::sink::AudioSink;
 use crate::audio::snapcast::{fifo_path, stream_id, SnapcastSink};
+use crate::audio::snapcast_control::SnapcastControl;
 
 /// Concurrent *playing* zones the hub supports (the snapserver stream pool size).
 /// Creating zones is unbounded; only playback consumes a slot.
@@ -26,6 +27,13 @@ struct Slot {
     stream_id: String,
     sink: Arc<SnapcastSink>,
     allocated_to: Option<String>,
+}
+
+/// One zone's desired Snapcast routing: the stream its group should play and the
+/// dongle client ids that should be in that group.
+pub struct ZoneRouting {
+    pub stream_id: String,
+    pub clients: Vec<String>,
 }
 
 /// A fixed pool of snapserver pipe streams, allocated one-per-playing-zone.
@@ -82,9 +90,65 @@ impl StreamPool {
     }
 }
 
+/// Converge snapserver's groups/streams to `entries`. Idempotent: re-running with
+/// the same desired state is a no-op-equivalent set of calls. For each zone whose
+/// clients are (partly) connected, pull the present clients into one group and
+/// bind that group to the zone's stream. Zones with no connected client yet are
+/// skipped — a later client-connect notification re-triggers reconcile.
+pub fn reconcile(control: &dyn SnapcastControl, entries: &[ZoneRouting]) -> Result<(), String> {
+    let status = control.get_status()?;
+    for entry in entries {
+        let present: Vec<String> = entry
+            .clients
+            .iter()
+            .filter(|c| status.is_connected(c))
+            .cloned()
+            .collect();
+        let Some(first) = present.first() else { continue };
+        let Some(group) = status.group_of(first) else { continue };
+        control.set_group_clients(group, &present)?;
+        control.set_group_stream(group, &entry.stream_id)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::snapcast_control::{ServerStatus, GroupInfo, SnapcastControl};
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct MockControl {
+        status: ServerStatus,
+        set_clients: StdMutex<Vec<(String, Vec<String>)>>,
+        set_stream: StdMutex<Vec<(String, String)>>,
+    }
+    impl SnapcastControl for MockControl {
+        fn get_status(&self) -> Result<ServerStatus, String> { Ok(self.status.clone()) }
+        fn set_group_clients(&self, group: &str, clients: &[String]) -> Result<(), String> {
+            self.set_clients.lock().unwrap().push((group.to_string(), clients.to_vec()));
+            Ok(())
+        }
+        fn set_group_stream(&self, group: &str, stream: &str) -> Result<(), String> {
+            self.set_stream.lock().unwrap().push((group.to_string(), stream.to_string()));
+            Ok(())
+        }
+    }
+
+    fn status_with(groups: Vec<GroupInfo>, connected: &[&str]) -> ServerStatus {
+        // ServerStatus.connected is private; build it via parse for the test by
+        // round-tripping a GetStatus-shaped value instead.
+        let groups_json: Vec<_> = groups.iter().map(|g| serde_json::json!({
+            "id": g.id, "stream_id": g.stream_id,
+            "clients": g.clients.iter().map(|c| serde_json::json!({
+                "id": c, "connected": connected.contains(&c.as_str())
+            })).collect::<Vec<_>>()
+        })).collect();
+        crate::audio::snapcast_control::parse_server_status(
+            &serde_json::json!({ "server": { "groups": groups_json } })
+        ).unwrap()
+    }
 
     #[test]
     fn allocate_reuses_the_same_slot_for_a_zone() {
@@ -118,5 +182,46 @@ mod tests {
         assert!(pool.stream_for("kitchen").is_none());
         let b = pool.allocate("bedroom").expect("slot freed");
         assert_eq!(a.stream_id, b.stream_id, "the freed slot is reused");
+    }
+
+    #[test]
+    fn reconcile_groups_present_clients_and_binds_stream() {
+        let control = MockControl {
+            status: status_with(vec![
+                GroupInfo { id: "gA".into(), stream_id: "default".into(),
+                            clients: vec!["d1".into()] },
+                GroupInfo { id: "gB".into(), stream_id: "default".into(),
+                            clients: vec!["d2".into()] },
+            ], &["d1", "d2"]),
+            ..Default::default()
+        };
+        let entries = vec![ZoneRouting {
+            stream_id: "as-0".into(),
+            clients: vec!["d1".into(), "d2".into()],
+        }];
+
+        reconcile(&control, &entries).expect("reconcile");
+
+        // Both present clients pulled into d1's group, bound to as-0.
+        assert_eq!(*control.set_clients.lock().unwrap(),
+                   vec![("gA".to_string(), vec!["d1".to_string(), "d2".to_string()])]);
+        assert_eq!(*control.set_stream.lock().unwrap(),
+                   vec![("gA".to_string(), "as-0".to_string())]);
+    }
+
+    #[test]
+    fn reconcile_skips_zone_with_no_connected_clients() {
+        let control = MockControl {
+            status: status_with(vec![
+                GroupInfo { id: "gA".into(), stream_id: "default".into(),
+                            clients: vec!["d1".into()] },
+            ], &[]), // d1 not connected
+            ..Default::default()
+        };
+        let entries = vec![ZoneRouting { stream_id: "as-0".into(), clients: vec!["d1".into()] }];
+
+        reconcile(&control, &entries).expect("reconcile");
+        assert!(control.set_clients.lock().unwrap().is_empty());
+        assert!(control.set_stream.lock().unwrap().is_empty());
     }
 }
