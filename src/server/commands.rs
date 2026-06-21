@@ -12,6 +12,9 @@ pub enum Task {
     Stop,
     Seek,
     Volume,
+    /// Client asks the hub to (re-)send the current speaker/zone list. Handled in
+    /// `Connection::handle_task` (it needs the connection to push), not `dispatch`.
+    ListOutputs,
     Unknown(String),
 }
 
@@ -23,6 +26,7 @@ impl Task {
             "stop" => Task::Stop,
             "seek" => Task::Seek,
             "volume" => Task::Volume,
+            "list_outputs" => Task::ListOutputs,
             other => Task::Unknown(other.to_string()),
         }
     }
@@ -35,6 +39,7 @@ impl Task {
             Task::Stop => "stop",
             Task::Seek => "seek",
             Task::Volume => "volume",
+            Task::ListOutputs => "list_outputs",
             Task::Unknown(name) => name,
         }
     }

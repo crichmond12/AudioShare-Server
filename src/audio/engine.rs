@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use lazy_static::lazy_static;
+use tokio::sync::broadcast;
 
 use crate::audio::decode;
 use crate::audio::output::AudioOutput;
@@ -34,10 +35,20 @@ use crate::audio::snapcast::{self, SnapcastSink, SnapserverSupervisor};
 const LOCAL_OUTPUT_ID: &str = "local";
 /// Zone used until the protocol carries a target zone (Change 4).
 const DEFAULT_ZONE: &str = "default";
+/// Display name reported for the hub's own (local) output in the target list.
+const HUB_DISPLAY_NAME: &str = "Hub";
 
 lazy_static! {
     /// Process-wide playback engine used by `commands::dispatch`.
     pub static ref ENGINE: Engine = Engine::new();
+
+    /// Broadcast tick fired whenever the set/state of outputs changes (a dongle
+    /// attaches or drops). Per-client `Connection`s subscribe and re-push the
+    /// current target list (`list_targets`) so the iOS speaker picker stays live.
+    /// Carries no payload — subscribers always re-query the full snapshot, so a
+    /// missed/lagged tick is harmless. The registry stays observer-free (per its
+    /// own doc); the engine owns this eventing.
+    pub static ref OUTPUTS_CHANGED: broadcast::Sender<()> = broadcast::channel(16).0;
 }
 
 /// Name of a zone (a group of outputs sharing playback).
@@ -210,6 +221,38 @@ impl Engine {
         Ok(())
     }
 
+    /// Snapshot of the zones a client can target for playback, as
+    /// `(zone, display_name, online)`, hub first. The hub's local output is
+    /// reported as the synthesized `"default"` zone named `"Hub"` and is always
+    /// listed (even before `ensure_local` lazily registers `"local"` on first
+    /// play). Each dongle follows, by display name — its zone equals its output
+    /// id, so no mapping is needed. Drives the iOS speaker picker.
+    pub fn list_targets(&self) -> Vec<(ZoneId, String, bool)> {
+        let mut dongles: Vec<(ZoneId, String, bool)> = self
+            .registry
+            .list()
+            .into_iter()
+            .filter(|(id, _, _)| id != LOCAL_OUTPUT_ID)
+            .collect();
+        dongles.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let mut targets = Vec::with_capacity(dongles.len() + 1);
+        targets.push((
+            DEFAULT_ZONE.to_string(),
+            HUB_DISPLAY_NAME.to_string(),
+            true,
+        ));
+        targets.extend(dongles);
+        targets
+    }
+
+    /// Notify subscribers (per-client connections) that the output set changed so
+    /// they re-push the target list. Fire-and-forget: a send error just means no
+    /// client is currently listening.
+    fn notify_outputs_changed(&self) {
+        let _ = OUTPUTS_CHANGED.send(());
+    }
+
     /// Register a dongle as an output and ensure `snapserver` is running so its
     /// `snapclient` has a stream to join. Called by the dongle registration
     /// listener (`server::dongle_server`) when a dongle connects. Re-registration
@@ -219,6 +262,7 @@ impl Engine {
     pub fn register_dongle(&self, id: &str, name: &str) -> Result<(), String> {
         self.ensure_snapcast()?;
         self.add_dongle_output(id, name);
+        self.notify_outputs_changed();
         Ok(())
     }
 
@@ -245,6 +289,7 @@ impl Engine {
     /// skipped when resolving sinks for playback. No-op if the id is unknown.
     pub fn dongle_offline(&self, id: &str) {
         self.registry.set_online(id, false);
+        self.notify_outputs_changed();
     }
 }
 
@@ -335,6 +380,59 @@ mod tests {
         let zones = engine.zones.lock().expect("zones");
         let zone = zones.get("dongle-1").expect("auto-zone created");
         assert_eq!(zone.outputs, vec!["dongle-1".to_string()]);
+    }
+
+    // list_targets always reports the synthesized "Hub" first (even with no
+    // local output registered yet), then dongles by name, and includes offline
+    // dongles with online=false. The "local" output id is never surfaced raw.
+    #[test]
+    fn list_targets_reports_hub_first_then_dongles() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d-2", "Living Room");
+        engine.add_dongle_output("d-1", "Bedroom");
+        engine.dongle_offline("d-2");
+
+        let targets = engine.list_targets();
+        // Hub is always first and online, even though `local` isn't registered.
+        assert_eq!(
+            targets[0],
+            (DEFAULT_ZONE.to_string(), HUB_DISPLAY_NAME.to_string(), true)
+        );
+        assert!(!targets.iter().any(|(zone, _, _)| zone == LOCAL_OUTPUT_ID));
+        // Dongles follow, sorted by display name; the offline one is included.
+        assert_eq!(
+            targets[1],
+            ("d-1".to_string(), "Bedroom".to_string(), true)
+        );
+        assert_eq!(
+            targets[2],
+            ("d-2".to_string(), "Living Room".to_string(), false)
+        );
+    }
+
+    // Registering and marking a dongle offline each fire OUTPUTS_CHANGED so live
+    // subscribers (per-client connections) re-push the target list.
+    #[test]
+    fn output_changes_notify_subscribers() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        // A tick is observed if recv returns Ok or Lagged (other tests share this
+        // global channel; Empty alone means our own send didn't land).
+        fn ticked(rx: &mut broadcast::Receiver<()>) -> bool {
+            !matches!(rx.try_recv(), Err(TryRecvError::Empty))
+        }
+
+        let engine = Engine::new();
+        let mut rx = OUTPUTS_CHANGED.subscribe();
+
+        // add_dongle_output is the device-free bookkeeping half (register_dongle
+        // would also spawn snapserver), so notify explicitly to mirror it.
+        engine.add_dongle_output("d-1", "Kitchen");
+        engine.notify_outputs_changed();
+        assert!(ticked(&mut rx));
+
+        engine.dongle_offline("d-1");
+        assert!(ticked(&mut rx));
     }
 
     // Disconnect marks the output offline (unresolvable for playback) but keeps

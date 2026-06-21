@@ -1,3 +1,4 @@
+use crate::audio::engine::{ENGINE, OUTPUTS_CHANGED};
 use crate::json_structs::json_trait::JsonSerializable;
 use crate::json_structs::response_data::SessionKeyResponseData;
 use crate::json_structs::server_response::ServerResponseData;
@@ -5,6 +6,7 @@ use crate::json_structs::task_response::TaskResponse;
 use crate::security::Security;
 use crate::server::commands;
 use crate::server::server::MAIN_SERVER;
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
@@ -55,8 +57,28 @@ impl<'connection> Connection<'connection> {
 
     pub async fn listen(&mut self) -> Result<bool, &'static str> {
         let mut buf = [0u8; 4096];
+
+        // Push the current speaker list once up front, then again on every
+        // change, so the iOS picker is populated on connect and stays live.
+        let mut outputs_changed = OUTPUTS_CHANGED.subscribe();
+        if self.send_outputs().await.is_err() {
+            return Ok(true);
+        }
+
         loop {
-            let read_result = timeout(Duration::from_secs(60), self.stream.read(&mut buf)).await;
+            let read_result = tokio::select! {
+                // Client → hub: an encrypted task message (or EOF/timeout).
+                result = timeout(Duration::from_secs(60), self.stream.read(&mut buf)) => result,
+                // Engine → client: outputs changed, re-push the snapshot. A
+                // lagged receiver just means several changes coalesced; we always
+                // send the full list, so re-pushing once catches up.
+                _ = outputs_changed.recv() => {
+                    if self.send_outputs().await.is_err() {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+            };
             match read_result {
                 Ok(Ok(n)) => {
                     if n == 0 {
@@ -116,6 +138,9 @@ impl<'connection> Connection<'connection> {
         request: &serde_json::Value,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let response = match request["task"].as_str() {
+            // `list_outputs` re-pushes the speaker list (it needs the connection,
+            // so it's handled here rather than in the stateless `dispatch`).
+            Some("list_outputs") => return self.send_outputs().await,
             Some(task_str) => {
                 let task = commands::Task::parse(task_str);
                 commands::dispatch(task, &request["data"])
@@ -126,8 +151,35 @@ impl<'connection> Connection<'connection> {
             }
         };
 
-        let encrypted = self.security.encrypt_data(response.to_json())?;
-        self.stream.write_all(encrypted.as_bytes()).await?;
+        self.send_encrypted(&response.to_json()).await
+    }
+
+    /// Push the current speaker/zone list to this client as an encrypted
+    /// `{"status":"ok","task":"outputs","data":{"outputs":[...]}}` message. Sent
+    /// on connect and whenever the output set changes, plus on a `list_outputs`
+    /// request. Each entry is `{ "zone", "name", "online" }`.
+    async fn send_outputs(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let outputs: Vec<serde_json::Value> = ENGINE
+            .list_targets()
+            .into_iter()
+            .map(|(zone, name, online)| json!({ "zone": zone, "name": name, "online": online }))
+            .collect();
+        let response = TaskResponse::accepted("outputs", Some(json!({ "outputs": outputs })));
+        self.send_encrypted(&response.to_json()).await
+    }
+
+    /// Encrypt `json` with the session key and write it newline-framed. The `\n`
+    /// delimits messages on the wire: task responses and unsolicited `outputs`
+    /// pushes are multiplexed on one socket, and base64 (STANDARD) never contains
+    /// `\n`, so the client can split cleanly. (The handshake response in
+    /// `start_new_connection` is read separately and stays unframed.)
+    async fn send_encrypted(
+        &mut self,
+        json: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut encrypted = self.security.encrypt_data(json.to_string())?.into_bytes();
+        encrypted.push(b'\n');
+        self.stream.write_all(&encrypted).await?;
         Ok(())
     }
 
