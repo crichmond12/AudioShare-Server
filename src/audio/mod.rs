@@ -4,4 +4,5 @@ pub mod output;
 pub mod registry;
 pub mod sink;
 pub mod snapcast;
+pub mod snapcast_control;
 pub mod snapcast_router;
