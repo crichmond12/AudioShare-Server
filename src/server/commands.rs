@@ -15,6 +15,10 @@ pub enum Task {
     /// Client asks the hub to (re-)send the current speaker/zone list. Handled in
     /// `Connection::handle_task` (it needs the connection to push), not `dispatch`.
     ListOutputs,
+    CreateZone,
+    DeleteZone,
+    RenameZone,
+    SetZoneOutputs,
     Unknown(String),
 }
 
@@ -27,6 +31,10 @@ impl Task {
             "seek" => Task::Seek,
             "volume" => Task::Volume,
             "list_outputs" => Task::ListOutputs,
+            "create_zone" => Task::CreateZone,
+            "delete_zone" => Task::DeleteZone,
+            "rename_zone" => Task::RenameZone,
+            "set_zone_outputs" => Task::SetZoneOutputs,
             other => Task::Unknown(other.to_string()),
         }
     }
@@ -40,6 +48,10 @@ impl Task {
             Task::Seek => "seek",
             Task::Volume => "volume",
             Task::ListOutputs => "list_outputs",
+            Task::CreateZone => "create_zone",
+            Task::DeleteZone => "delete_zone",
+            Task::RenameZone => "rename_zone",
+            Task::SetZoneOutputs => "set_zone_outputs",
             Task::Unknown(name) => name,
         }
     }
@@ -72,6 +84,8 @@ pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
                     let code = match e.as_str() {
                         "unknown_zone" => "unknown_zone",
                         "zone_has_no_outputs" => "zone_has_no_outputs",
+                        "no_free_stream" => "no_free_stream",
+                        "mixed_zone_unsupported" => "mixed_zone_unsupported",
                         _ => "playback_failed",
                     };
                     TaskResponse::error("play", code)
@@ -87,6 +101,40 @@ pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
             ENGINE.stop(zone);
             println!("Stopped playback on zone {}", zone);
             TaskResponse::accepted("stop", None)
+        }
+        Task::CreateZone => {
+            let name = data["name"].as_str().unwrap_or("Zone");
+            let id = ENGINE.create_zone(name);
+            TaskResponse::accepted("create_zone", Some(json!({ "zone": id })))
+        }
+        Task::DeleteZone => match data["zone"].as_str() {
+            Some(zone) if !zone.is_empty() => match ENGINE.delete_zone(zone) {
+                Ok(()) => TaskResponse::accepted("delete_zone", None),
+                Err(code) => TaskResponse::error("delete_zone", code),
+            },
+            _ => TaskResponse::error("delete_zone", "unknown_zone"),
+        },
+        Task::RenameZone => match (data["zone"].as_str(), data["name"].as_str()) {
+            (Some(zone), Some(name)) if !zone.is_empty() => match ENGINE.rename_zone(zone, name) {
+                Ok(()) => TaskResponse::accepted("rename_zone", None),
+                Err(code) => TaskResponse::error("rename_zone", code),
+            },
+            _ => TaskResponse::error("rename_zone", "unknown_zone"),
+        },
+        Task::SetZoneOutputs => {
+            let zone = data["zone"].as_str().unwrap_or("");
+            let outputs: Vec<String> = data["outputs"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if zone.is_empty() {
+                TaskResponse::error("set_zone_outputs", "unknown_zone")
+            } else {
+                match ENGINE.set_zone_outputs(zone, &outputs) {
+                    Ok(()) => TaskResponse::accepted("set_zone_outputs", None),
+                    Err(code) => TaskResponse::error("set_zone_outputs", code),
+                }
+            }
         }
         Task::Unknown(ref name) => {
             println!("Rejected unsupported task: {}", name);
@@ -162,5 +210,31 @@ mod tests {
         assert!(json.contains("\"status\":\"error\""));
         assert!(json.contains("\"error\":\"unknown_zone\""));
         assert!(json.contains("\"task\":\"play\""));
+    }
+
+    #[test]
+    fn create_zone_returns_id() {
+        let data = serde_json::json!({ "name": "Upstairs" });
+        let json = dispatch(Task::parse("create_zone"), &data).to_json();
+        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"task\":\"create_zone\""));
+        assert!(json.contains("\"zone\":\""));
+    }
+
+    #[test]
+    fn delete_unknown_zone_errors() {
+        let data = serde_json::json!({ "zone": "ghost" });
+        let json = dispatch(Task::parse("delete_zone"), &data).to_json();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"unknown_zone\""));
+    }
+
+    #[test]
+    fn set_zone_outputs_unknown_output_errors() {
+        // Target the always-present default zone with a non-existent output.
+        let data = serde_json::json!({ "zone": "default", "outputs": ["ghost"] });
+        let json = dispatch(Task::parse("set_zone_outputs"), &data).to_json();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"unknown_output\""));
     }
 }

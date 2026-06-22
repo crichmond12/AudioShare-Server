@@ -29,7 +29,7 @@ use crate::audio::decode;
 use crate::audio::output::AudioOutput;
 use crate::audio::registry::{Output, OutputId, OutputRegistry};
 use crate::audio::sink::AudioSink;
-use crate::audio::snapcast::{self, SnapcastSink, SnapserverSupervisor};
+use crate::audio::snapcast_router::SnapcastRouter;
 
 /// Reserved id for the host's own cpal output device.
 const LOCAL_OUTPUT_ID: &str = "local";
@@ -70,26 +70,29 @@ impl Pipeline {
 
 /// A zone's membership plus its current in-flight playback (if any).
 struct ZonePlayback {
+    name: String,
     outputs: Vec<OutputId>,
     current: Option<Pipeline>,
+}
+
+/// A zone as reported to clients: id, label, member output ids, and whether it
+/// currently has playback.
+pub struct ZoneView {
+    pub zone: ZoneId,
+    pub name: String,
+    pub outputs: Vec<String>,
+    pub playing: bool,
 }
 
 /// The multi-room playback engine. Shared process-wide via [`ENGINE`].
 pub struct Engine {
     registry: Arc<OutputRegistry>,
     zones: Mutex<HashMap<ZoneId, ZonePlayback>>,
-    /// The supervised `snapserver`, spawned lazily on the first dongle
-    /// registration (see [`ensure_snapcast`](Self::ensure_snapcast)). `None`
-    /// until then so construction and the local-only path touch no process.
-    snapserver: Mutex<Option<SnapserverSupervisor>>,
-    /// The single shared sink feeding `snapserver`'s one input stream. Every
-    /// registered dongle's output points at *this* sink, so in sub-step 2 all
-    /// dongles are snapclients of one stream and play the **same** audio (one
-    /// synchronized group). Per-dongle independent streams/grouping is sub-step 3
-    /// (snapserver JSON-RPC); until then, routing two zones to two dongles at once
-    /// would interleave both into this one FIFO and garble — by design, not a bug.
-    /// Constructing it does no I/O, so this is safe to build eagerly.
-    snapcast_sink: Arc<dyn AudioSink>,
+    /// The Snapcast router: owns the supervised snapserver, the stream pool,
+    /// control connection, and event listener. Created lazily on first dongle
+    /// zone play (inside `sink_for_zone`). Dongle outputs carry `sink: None`
+    /// in the registry — the router allocates a per-zone FIFO sink at play time.
+    snapcast: SnapcastRouter,
 }
 
 impl Engine {
@@ -100,6 +103,7 @@ impl Engine {
         zones.insert(
             DEFAULT_ZONE.to_string(),
             ZonePlayback {
+                name: HUB_DISPLAY_NAME.to_string(),
                 outputs: vec![LOCAL_OUTPUT_ID.to_string()],
                 current: None,
             },
@@ -107,10 +111,7 @@ impl Engine {
         Self {
             registry: Arc::new(OutputRegistry::new()),
             zones: Mutex::new(zones),
-            snapserver: Mutex::new(None),
-            // I/O-free: the FIFO is opened lazily on first write once snapserver
-            // is reading it (see `SnapcastSink`).
-            snapcast_sink: Arc::new(SnapcastSink::new(snapcast::DEFAULT_FIFO_PATH)),
+            snapcast: SnapcastRouter::new(),
         }
     }
 
@@ -126,36 +127,40 @@ impl Engine {
         self.registry.register(Output {
             id: LOCAL_OUTPUT_ID.to_string(),
             name: "Local".to_string(),
-            sink: Arc::clone(&sink),
+            sink: Some(Arc::clone(&sink)),
             online: true,
         });
         Ok(sink)
     }
 
-    /// Resolve a zone's online outputs to a single sink to decode into: the lone
-    /// sink directly when there's exactly one (preserving its native rate), or a
-    /// [`FanOut`] over several. Errors if the zone is unknown or has no
-    /// reachable outputs.
-    fn zone_sink(&self, outputs: &[OutputId]) -> Result<Arc<dyn AudioSink>, String> {
-        // The local device is opened on demand; other outputs (dongles) must
-        // already be registered + online to participate.
-        if outputs.iter().any(|o| o == LOCAL_OUTPUT_ID) {
-            self.ensure_local()?;
+    /// Resolve a zone's online outputs to a single sink to decode into.
+    /// Local zones open the cpal device lazily; dongle zones allocate a
+    /// per-zone stream from the `SnapcastRouter`. Mixed zones are rejected.
+    /// Errors if the zone has no reachable outputs or (dongle path) the pool
+    /// is exhausted.
+    fn zone_sink(&self, zone: &str, outputs: &[OutputId]) -> Result<Arc<dyn AudioSink>, String> {
+        let has_local = outputs.iter().any(|o| o == LOCAL_OUTPUT_ID);
+        let dongle_ids: Vec<String> =
+            outputs.iter().filter(|o| *o != LOCAL_OUTPUT_ID).cloned().collect();
+
+        // Mixed zones are rejected at set_zone_outputs; defend here too.
+        if has_local && !dongle_ids.is_empty() {
+            return Err("mixed_zone_unsupported".to_string());
         }
 
-        let mut sinks: Vec<Arc<dyn AudioSink>> = outputs
-            .iter()
-            .filter_map(|id| self.registry.sink(id))
+        if has_local {
+            return self.ensure_local();
+        }
+
+        // Dongle zone: only online dongles participate.
+        let online: Vec<String> = dongle_ids
+            .into_iter()
+            .filter(|id| self.registry.list().iter().any(|(i, _, on)| i == id && *on))
             .collect();
-
-        match sinks.len() {
-            0 => Err("zone_has_no_outputs".to_string()),
-            // Single sink: pass through directly so decode resamples to the
-            // device's own rate. Wrapping in FanOut would force a canonical rate
-            // the device may not run at.
-            1 => Ok(sinks.pop().expect("len checked")),
-            _ => Ok(Arc::new(FanOut::new(sinks))),
+        if online.is_empty() {
+            return Err("zone_has_no_outputs".to_string());
         }
+        self.snapcast.sink_for_zone(zone, &online)
     }
 
     /// Start streaming `url` to `zone`, replacing that zone's current playback.
@@ -164,16 +169,26 @@ impl Engine {
     /// stream/decode failures surface on the decode thread and simply end
     /// playback.
     pub fn play(&self, zone: &str, url: &str) -> Result<(), String> {
+        // Snapshot the zone's outputs under the lock, then RELEASE it: resolving
+        // the sink can spawn snapserver / make snapserver JSON-RPC calls (a
+        // network round-trip), and holding `zones` across that would stall every
+        // other engine method that locks `zones`.
+        let outputs = {
+            let zones = self.zones.lock().expect("engine zones mutex poisoned");
+            zones
+                .get(zone)
+                .map(|z| z.outputs.clone())
+                .ok_or_else(|| "unknown_zone".to_string())?
+        };
+
+        let sink = self.zone_sink(zone, &outputs)?;
+
+        // Reacquire only to swap in the new pipeline. The zone may have been
+        // removed while the lock was released, and a concurrent play on the same
+        // zone may have installed a pipeline — taking+shutting the existing one
+        // before installing ours guarantees at most one active decoder per zone.
         let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
-        let outputs = zones
-            .get(zone)
-            .map(|z| z.outputs.clone())
-            .ok_or_else(|| "unknown_zone".to_string())?;
-
-        let sink = self.zone_sink(&outputs)?;
-
-        // Stop this zone's existing playback before starting the new stream.
-        let zone_state = zones.get_mut(zone).expect("zone existed above");
+        let zone_state = zones.get_mut(zone).ok_or_else(|| "unknown_zone".to_string())?;
         if let Some(pipeline) = zone_state.current.take() {
             pipeline.shutdown();
         }
@@ -203,22 +218,8 @@ impl Engine {
                 pipeline.shutdown();
             }
         }
-    }
-
-    /// Spawn the supervised `snapserver` if it isn't already running. Idempotent
-    /// and lazy, mirroring [`ensure_local`](Self::ensure_local): the one place the
-    /// snapserver process is launched, so a missing `snapserver` binary surfaces
-    /// here (to the registering dongle) rather than at construction. Dongles can't
-    /// hear anything until snapserver is up, so registration depends on this.
-    fn ensure_snapcast(&self) -> Result<(), String> {
-        let mut guard = self
-            .snapserver
-            .lock()
-            .expect("engine snapserver mutex poisoned");
-        if guard.is_none() {
-            *guard = Some(SnapserverSupervisor::spawn()?);
-        }
-        Ok(())
+        drop(zones);
+        self.snapcast.release_zone(zone);
     }
 
     /// Snapshot of the zones a client can target for playback, as
@@ -253,32 +254,38 @@ impl Engine {
         let _ = OUTPUTS_CHANGED.send(());
     }
 
-    /// Register a dongle as an output and ensure `snapserver` is running so its
-    /// `snapclient` has a stream to join. Called by the dongle registration
+    /// Register a dongle as an output. Called by the dongle registration
     /// listener (`server::dongle_server`) when a dongle connects. Re-registration
     /// (a dongle reconnecting) brings the existing output back online and keeps
-    /// its zone — including any in-flight playback — intact. Errors only if
-    /// `snapserver` can't be launched.
+    /// its zone — including any in-flight playback — intact. Snapserver is NOT
+    /// launched here; it starts lazily on the first dongle-zone `play` via
+    /// `zone_sink` → `SnapcastRouter::sink_for_zone`. `reconcile_now` is called
+    /// so a reconnecting dongle lands on the right stream if its zone is already
+    /// playing. Always returns `Ok(())`.
     pub fn register_dongle(&self, id: &str, name: &str) -> Result<(), String> {
-        self.ensure_snapcast()?;
         self.add_dongle_output(id, name);
         self.notify_outputs_changed();
+        // A reconnecting client may already be present; reconcile so it lands on
+        // the right stream if its zone is playing.
+        self.snapcast.reconcile_now();
         Ok(())
     }
 
     /// Registry + zone bookkeeping for a dongle (no I/O — split out so it is
-    /// unit-testable without a `snapserver`). The dongle's output points at the
-    /// shared [`snapcast_sink`](Self::snapcast_sink); an auto-zone named after the
-    /// dongle is created so `play {zone:<dongle>}` works before zone CRUD exists.
+    /// unit-testable without snapserver). The dongle output carries `sink: None`
+    /// because it is grouped in snapserver; the router allocates a per-zone FIFO
+    /// sink at play time. An auto-zone named after the dongle is created so
+    /// `play {zone:<dongle>}` works before zone CRUD exists.
     fn add_dongle_output(&self, id: &str, name: &str) {
         self.registry.register(Output {
             id: id.to_string(),
             name: name.to_string(),
-            sink: Arc::clone(&self.snapcast_sink),
+            sink: None,
             online: true,
         });
         let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
         zones.entry(id.to_string()).or_insert_with(|| ZonePlayback {
+            name: name.to_string(),
             outputs: vec![id.to_string()],
             current: None,
         });
@@ -290,6 +297,83 @@ impl Engine {
     pub fn dongle_offline(&self, id: &str) {
         self.registry.set_online(id, false);
         self.notify_outputs_changed();
+    }
+
+    /// Create a new, empty, user-named zone and return its generated id.
+    /// Duplicate names are allowed — the id is the identity.
+    pub fn create_zone(&self, name: &str) -> ZoneId {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.zones.lock().expect("engine zones mutex poisoned").insert(
+            id.clone(),
+            ZonePlayback { name: name.to_string(), outputs: Vec::new(), current: None },
+        );
+        self.notify_outputs_changed();
+        id
+    }
+
+    /// Delete a zone, stopping its playback and freeing its Snapcast stream.
+    pub fn delete_zone(&self, zone: &str) -> Result<(), String> {
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        let removed = zones.remove(zone).ok_or_else(|| "unknown_zone".to_string())?;
+        drop(zones);
+        if let Some(pipeline) = removed.current {
+            pipeline.shutdown();
+        }
+        self.snapcast.release_zone(zone);
+        self.notify_outputs_changed();
+        Ok(())
+    }
+
+    /// Rename a zone's label. Duplicate names are allowed.
+    pub fn rename_zone(&self, zone: &str, name: &str) -> Result<(), String> {
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        let z = zones.get_mut(zone).ok_or_else(|| "unknown_zone".to_string())?;
+        z.name = name.to_string();
+        drop(zones);
+        self.notify_outputs_changed();
+        Ok(())
+    }
+
+    /// Set a zone's member outputs (the single membership mutator). Enforces that
+    /// a zone is all-dongle or all-local, never mixed, and that every id is a
+    /// known output.
+    pub fn set_zone_outputs(&self, zone: &str, outputs: &[String]) -> Result<(), String> {
+        let has_local = outputs.iter().any(|o| o == LOCAL_OUTPUT_ID);
+        let has_dongle = outputs.iter().any(|o| o != LOCAL_OUTPUT_ID);
+        if has_local && has_dongle {
+            return Err("mixed_zone_unsupported".to_string());
+        }
+        for id in outputs {
+            if id != LOCAL_OUTPUT_ID && !self.registry.contains(id) {
+                return Err("unknown_output".to_string());
+            }
+        }
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        let z = zones.get_mut(zone).ok_or_else(|| "unknown_zone".to_string())?;
+        z.outputs = outputs.to_vec();
+        drop(zones);
+        self.snapcast.reconcile_now();
+        self.notify_outputs_changed();
+        Ok(())
+    }
+
+    /// Snapshot of all zones for the client `zones` push.
+    pub fn list_zones(&self) -> Vec<ZoneView> {
+        let zones = self.zones.lock().expect("engine zones mutex poisoned");
+        zones
+            .iter()
+            .map(|(id, z)| ZoneView {
+                zone: id.clone(),
+                name: z.name.clone(),
+                outputs: z.outputs.clone(),
+                playing: z.current.is_some(),
+            })
+            .collect()
+    }
+
+    /// Re-run Snapcast reconcile (fired by snapserver client-connect events).
+    pub fn snapcast_on_notify(&self) {
+        self.snapcast.reconcile_now();
     }
 }
 
@@ -304,7 +388,8 @@ impl Default for Engine {
 /// canonical format that all members must accept; reconciling member device
 /// rates is deferred to Change 5 (network sinks negotiate a shared format).
 /// Only constructed for zones with ≥2 outputs, so it is unused until a real
-/// second output exists.
+/// second output exists. Reserved for multi-local-output zones.
+#[allow(dead_code)]
 struct FanOut {
     sinks: Vec<Arc<dyn AudioSink>>,
     sample_rate: u32,
@@ -368,15 +453,18 @@ mod tests {
         assert_eq!(err, "unknown_zone");
     }
 
-    // A dongle registers as an online output (resolving to the shared snapcast
-    // sink) with an auto-zone named after it. Device-free: exercises only the
-    // registry/zone bookkeeping, not the snapserver spawn.
+    // A dongle registers as an online output (with no direct sink — grouped in
+    // snapserver) with an auto-zone named after it. Device-free: exercises only
+    // the registry/zone bookkeeping, not the snapserver spawn.
     #[test]
     fn add_dongle_output_registers_and_creates_zone() {
         let engine = Engine::new();
         engine.add_dongle_output("dongle-1", "Kitchen");
 
-        assert!(engine.registry.sink("dongle-1").is_some());
+        // A dongle has no direct sink (grouped in snapserver), but is registered…
+        assert!(engine.registry.sink("dongle-1").is_none());
+        assert!(engine.registry.contains("dongle-1"));
+        // …and an auto-zone is created for it.
         let zones = engine.zones.lock().expect("zones");
         let zone = zones.get("dongle-1").expect("auto-zone created");
         assert_eq!(zone.outputs, vec!["dongle-1".to_string()]);
@@ -435,6 +523,10 @@ mod tests {
         assert!(ticked(&mut rx));
     }
 
+    fn dongle_online(engine: &Engine, id: &str) -> Option<bool> {
+        engine.registry.list().into_iter().find(|(i, _, _)| i == id).map(|(_, _, on)| on)
+    }
+
     // Disconnect marks the output offline (unresolvable for playback) but keeps
     // its zone so a reconnecting dongle keeps its identity.
     #[test]
@@ -443,7 +535,7 @@ mod tests {
         engine.add_dongle_output("dongle-1", "Kitchen");
         engine.dongle_offline("dongle-1");
 
-        assert!(engine.registry.sink("dongle-1").is_none());
+        assert_eq!(dongle_online(&engine, "dongle-1"), Some(false));
         assert!(engine.zones.lock().expect("zones").contains_key("dongle-1"));
     }
 
@@ -453,10 +545,10 @@ mod tests {
         let engine = Engine::new();
         engine.add_dongle_output("d", "Name");
         engine.dongle_offline("d");
-        assert!(engine.registry.sink("d").is_none());
+        assert_eq!(dongle_online(&engine, "d"), Some(false));
 
         engine.add_dongle_output("d", "Name");
-        assert!(engine.registry.sink("d").is_some());
+        assert_eq!(dongle_online(&engine, "d"), Some(true));
     }
 
     #[test]
@@ -489,6 +581,69 @@ mod tests {
 
         thread::sleep(Duration::from_secs(3));
         engine.stop(DEFAULT_ZONE);
+    }
+
+    #[test]
+    fn create_then_set_outputs_and_list() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_dongle_output("d2", "Bedroom");
+
+        let zone = engine.create_zone("Upstairs");
+        engine.set_zone_outputs(&zone, &["d1".to_string(), "d2".to_string()]).expect("set");
+
+        let view = engine.list_zones().into_iter().find(|z| z.zone == zone).expect("zone listed");
+        assert_eq!(view.name, "Upstairs");
+        assert_eq!(view.outputs, vec!["d1".to_string(), "d2".to_string()]);
+        assert!(!view.playing);
+    }
+
+    #[test]
+    fn duplicate_names_are_allowed_with_distinct_ids() {
+        let engine = Engine::new();
+        let a = engine.create_zone("Group");
+        let b = engine.create_zone("Group");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn set_zone_outputs_rejects_mixing_local_and_dongle() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        let zone = engine.create_zone("Mix");
+        let err = engine
+            .set_zone_outputs(&zone, &["local".to_string(), "d1".to_string()])
+            .unwrap_err();
+        assert_eq!(err, "mixed_zone_unsupported");
+    }
+
+    #[test]
+    fn set_zone_outputs_rejects_unknown_output() {
+        let engine = Engine::new();
+        let zone = engine.create_zone("Z");
+        let err = engine.set_zone_outputs(&zone, &["ghost".to_string()]).unwrap_err();
+        assert_eq!(err, "unknown_output");
+    }
+
+    #[test]
+    fn set_outputs_unknown_zone_errors() {
+        let engine = Engine::new();
+        let err = engine.set_zone_outputs("nope", &[]).unwrap_err();
+        assert_eq!(err, "unknown_zone");
+    }
+
+    #[test]
+    fn rename_and_delete_zone() {
+        let engine = Engine::new();
+        let zone = engine.create_zone("Old");
+        engine.rename_zone(&zone, "New").expect("rename");
+        assert_eq!(
+            engine.list_zones().into_iter().find(|z| z.zone == zone).unwrap().name,
+            "New"
+        );
+        engine.delete_zone(&zone).expect("delete");
+        assert!(engine.list_zones().into_iter().all(|z| z.zone != zone));
+        assert_eq!(engine.delete_zone(&zone).unwrap_err(), "unknown_zone");
     }
 
     // FanOut forwards writes to every member sink.

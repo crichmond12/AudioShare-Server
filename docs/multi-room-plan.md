@@ -438,9 +438,85 @@ all of them until sub-step 3. Comment this loudly so it isn't mistaken for a bug
     handling is testable with a mock.
   - **Still deferred to later sub-steps:** auth on the dongle channel; iOS
     scan-and-assign (2.5); hub-driven per-dongle grouping (sub-step 3).
-- **2.5** iOS app: scan `_audioshare-dongle._tcp`, assign to the current hub —
-  **cross-project**, mirrored in `~/Documents/Audio Share/`. Sequenced after the
-  headless hub+agent path works.
+- **2.5** ✅ **Landed (iOS side).** iOS app: scan `_audioshare-dongle._tcp`,
+  assign to the current hub — **cross-project**, in `~/Documents/Audio Share/`.
+  Three new files: `Managers/DongleDiscoveryManager.swift` (an `NWBrowser` +
+  `NetService` browse of `_audioshare-dongle._tcp`, parallel to the hub's
+  `ServiceDiscoveryManager`; resolves each dongle's TXT `id`/`name` + IPv4 into a
+  published `[DiscoveredDongle]`, upserted by `id`, pruned as adverts leave),
+  `Managers/DongleAssignmentManager.swift` (speaks the agent's assignment
+  handshake — connects to the dongle's listener on `DONGLE_ASSIGNMENT_PORT`
+  (50507), sends one newline-delimited `AppToDongle::Assign { hub_host, hub_port
+  = HUB_REGISTRATION_PORT 50506 }`, awaits `DongleToApp::Assigned { dongle_id }`;
+  `hub_host` is the hub IP the app is paired to via
+  `ConnectionManager.getLocalServerIPAddress()`), and
+  `Controllers/Library/DongleListView.swift` (a `List` of discovered dongles with
+  a per-row "Add to this hub" button + status, reachable from `Library` via a
+  `NavigationLink` "Add a Speaker"). The assignment wire types mirror
+  `audioshare_protocol`'s `AppToDongle`/`DongleToApp` (tagged JSON, `type` field)
+  — the shared-crate discipline doesn't cover the iOS client, so this is the
+  hand-mirrored boundary to keep in sync. Replaces the free-text Zone field's job
+  of *finding* a dongle (the field stays as the way to *target* one until a
+  playback picker lands). Not built: auth on the assignment/registration channels;
+  hub-driven per-dongle grouping (sub-step 3). **Untested on-device** — the dev
+  box has only Command Line Tools (no `xcodebuild`); needs a build + a real
+  agent on the LAN to verify the browse + handshake.
+
+#### Bring-up note — the dongle agent's mDNS advert is invisible on macOS (2026-06-20)
+
+Running the dongle agent on a **Mac** for dev, its mDNS advert
+(`_audioshare-dongle._tcp` via the pure-Rust `mdns-sd` crate) is **not
+discoverable** by `dns-sd` or the iOS app, even though the agent logs
+"Unassigned. Advertising as …". Cause: macOS already runs Apple's
+`mDNSResponder` (and often a second responder — Chrome/Google was holding UDP
+5353 here), which is what `dns-sd` and iOS `NWBrowser` query; the `mdns-sd`
+crate runs its **own** responder and its records never reach Apple's. The hub's
+advert works only because the hub runs on **Linux**, where `mdns-sd` owns the
+mDNS stack. Confirmed: `dns-sd -B _audioshare._tcp` lists the (Linux) hub but
+`dns-sd -B _audioshare-dongle._tcp` lists nothing while the Mac agent runs.
+
+This is a **macOS-as-dongle dev artifact, not a protocol/app bug** — production
+dongles are Linux SBCs where discovery works (same as the hub). Two ways to test
+the iOS sub-step 2.5 path regardless:
+- **Real verification:** run the agent on a Pi/Linux box; the iPhone discovers it
+  natively, no shim.
+- **Mac dev shim:** advertise the service through Apple's responder while the
+  *real* agent still handles the TCP assignment on 50507 —
+  `dns-sd -R "<name>" _audioshare-dongle._tcp local 50507 id=<agent's real uuid> name="<name>"`
+  (keep it running). The app then discovers via Apple's advert, resolves the
+  TXT `id`/`name` + the Mac's IP, and connects to 50507 (the agent), which
+  receives `Assign`, persists, acks, and registers with the hub. The `id` TXT
+  **must** be the agent's persisted UUID so the hub registers the output/zone
+  under the id playback will target.
+
+(If macOS dongle discovery ever needs to work natively, the agent would have to
+advertise via Apple's `dns_sd` C API on macOS instead of `mdns-sd` — not worth
+it for a Linux-only production target.)
+
+#### Sub-step 3 — landed (2026-06-21)
+
+Per-zone independent Snapcast streams + hub-driven grouping. Builds directly on the sub-step 2 architecture; no protocol or crate layout changes. Update `CLAUDE.md` (protocol/state source of truth) when this section changes.
+
+**What it delivers.** Each dongle zone plays its own independent audio stream; a user-created multi-dongle zone plays one synchronized stream across all members (Snapcast clock-aligns them). Zone CRUD (create/rename/delete zones, set membership) is live both in the engine and over the wire. The manual `Group.SetStream` bring-up workaround from note #2 is gone — the reconciler handles it automatically.
+
+**`SnapcastSink` backpressure fix (sub-step 3.1, `audio/snapcast.rs`).** Prior to this step the sink opened the FIFO non-blocking and dropped samples when the pipe was full, causing choppy audio (KAN-23 Snapcast variant). Fix: keep the blocking open (already landed as a cold-start fix in sub-step 2), and leave the file descriptor blocking thereafter so subsequent writes naturally pace the decode thread instead of dropping overflow. One `SnapcastSink` instance per pool FIFO (no longer a single shared sink).
+
+**Multi-stream pool (sub-step 3.2, `audio/snapcast.rs`).** `SnapserverSupervisor` now launches `snapserver` with `STREAM_POOL_SIZE = 16` pipe streams named `as-0` … `as-15`, each reading its own FIFO at `/tmp/audioshare-snapfifo-{k}`. A `StreamPool` tracks which slot is allocated to which zone. Pool is sized for concurrent *playing* zones, not total dongles — creating zones is unbounded; playing zones consume a slot.
+
+**JSON-RPC control client (sub-step 3.3, `audio/snapcast_control.rs`).** `CommandConn` maintains a persistent TCP connection to `snapserver`'s control port (`127.0.0.1:1705`), speaking newline-delimited JSON-RPC 2.0. Requests used: `Server.GetStatus`, `Group.SetClients`, `Group.SetStream`. `EventListener` reads `snapserver` push notifications (`Client.OnConnect`, `Client.OnDisconnect`, `Server.OnUpdate`) on the same socket and signals the reconciler. Both are defined behind a `SnapcastControl` trait for unit testing against a mock.
+
+**`SnapcastRouter` + desired-state reconciler (sub-step 3.4, `audio/snapcast_router.rs`).** The `SnapcastRouter` is the engine's single seam into Snapcast — the engine never speaks JSON-RPC itself. It owns the `SnapserverSupervisor`, the `SnapcastControl` client, and the stream pool. API:
+- `sink_for_zone(zone, dongle_ids)` — allocates a free pool slot (`no_free_stream` if all 16 are in use), records desired grouping (zone → stream, dongle → zone), fires a reconcile, returns the slot's `SnapcastSink` to the decode thread.
+- `release_zone(zone)` — frees the pool slot; clients stay grouped on the now-idle (silent) FIFO to avoid churn.
+- `reconcile_now()` (idempotent) — for each active zone: `GetStatus` → find the zone's dongles' clients → `Group.SetClients(group, client_ids)` → `Group.SetStream(group, slot_stream_id)`. Also fired on every `Client.OnConnect`/`OnDisconnect` notification, so a late-connecting `snapclient` is pulled onto the right stream automatically.
+
+**Engine changes (sub-step 3.4, `audio/engine.rs`).** The shared `Arc<SnapcastSink>` field is replaced by a `SnapcastRouter`. Dongle `Output`s carry `sink: None` — `Output.sink` is now `Option<Arc<dyn AudioSink>>`; only the local cpal output carries a real sink. The router allocates a per-zone FIFO sink at play time. Zone routing in `play`: all-local → existing single/FanOut local path (unchanged); any-dongle (enforced all-dongle) → `router.sink_for_zone(...)`. Mixed local+dongle → blocked at `set_zone_outputs` time (`mixed_zone_unsupported`) and defended inside `zone_sink` as well.
+
+**Zone CRUD + wire protocol (sub-step 3.5).** New engine methods: `create_zone(name) -> ZoneId` (generates a UUID id, empty membership; duplicate names allowed), `delete_zone(zone)`, `rename_zone(zone, name)`, `set_zone_outputs(zone, [output_ids])` (enforces all-dongle or all-local). All four are exposed as wire tasks routed by `commands::dispatch()`. New wire push: `zones` message on every `OUTPUTS_CHANGED` trigger and on `list_zones` pull — carries `{ zone, name, outputs, playing }` per zone (full detail in `CLAUDE.md` protocol section). The flat `outputs` push is retained for iOS back-compat.
+
+**Device-free tests cover:** stream pool allocate/release/exhaustion; reconciler logic against a mock `SnapcastControl`; `SnapcastControl` JSON-RPC request/response + notification parsing against a loopback mock snapserver; engine zone CRUD + constraint enforcement; `SnapcastSink` backpressure via a real temp FIFO + draining reader thread. Demo-gated path (needs `snapserver` + 2× `snapclient` + audio hardware): two dongles → independent audio; `create_zone` + `set_zone_outputs` grouping both → synchronized audio; late-joining dongle auto-assigned to the correct stream.
+
+**Still deferred:** iOS grouping UI (own spec; wire contract frozen in `CLAUDE.md`); auth on the dongle registration/assignment channels; general local-output jitter buffer (KAN-23 base, not the Snapcast variant).
 
 #### Bring-up notes (first real laptop-as-dongle demo, 2026-06-20)
 
@@ -458,15 +534,7 @@ doesn't rediscover them:
    flashable-image setup** — it'll bite every user. (A more self-contained fix:
    have the hub launch `snapserver` with an explicit minimal config so it never
    collides — worth considering for packaging.)
-2. **New `snapclient`s land on the wrong stream.** `snapserver.conf` ships a
-   `default` stream; a freshly-connected client is placed in a group bound to
-   `default`, **not** the hub's `AudioShare` pipe stream — so even with audio
-   flowing into `AudioShare`, the client hears nothing. Manual workaround via the
-   control RPC on 1705:
-   `Group.SetStream {id:<group>, stream_id:"AudioShare"}` (find `<group>` from
-   `Server.GetStatus`). **This is exactly what sub-step 3 automates** — the hub
-   programs snapserver groups/streams from zone membership over JSON-RPC so it's
-   never manual. The manual RPC is also not persistent across reconnects.
+2. ~~**New `snapclient`s land on the wrong stream.**~~ **Retired — automated by sub-step 3 reconciler.** Previously, `snapserver.conf`'s `default` stream trapped freshly-connected clients, requiring a manual `Group.SetStream {id:<group>, stream_id:"AudioShare"}` via the control RPC on 1705. The sub-step 3 desired-state reconciler now handles this automatically: every `Client.OnConnect` notification triggers a reconcile that calls `Group.SetClients` + `Group.SetStream` to pull the client onto the correct pool stream. No manual intervention needed; the workaround is not persistent across reconnects and is gone.
 3. **iOS hardcoded `zone:"default"`.** `Library.swift` sent every `play`/`stop`
    with `zone:"default"`, so playback always hit the hub's local output, never a
    dongle. Added a free-text **Zone** field (type a dongle UUID to target it) as a
@@ -484,6 +552,37 @@ doesn't rediscover them:
    `O_NONBLOCK` via `fcntl`), or feed snapserver through a paced ring buffer. This
    is the Snapcast-path sibling of the local-output prebuffering already done in
    commit 550a50d; the local fix doesn't cover this sink.
+
+#### Bring-up notes (Pi-hub → Pi-dongle, cold-start race fixed, 2026-06-21)
+
+Full path proven again (macOS hub → Pi dongle agent → `snapclient` → speaker).
+Registration was clean once both ends ran current binaries; the only hard failure
+was the **first play producing no sound**.
+
+5. **Cold-start race — fixed (commit 9c70373).** `SnapcastSink::open_fifo_write`
+   opened the FIFO `O_NONBLOCK`, which returns `ENXIO` whenever `snapserver`'s read
+   end is momentarily closed (it cycles open/closed while it has no writer). The
+   non-blocking writer and the polling reader missed each other and **every decoded
+   buffer was silently dropped** — measured 17s–2min before audio, past
+   `snapclient`'s 5s no-chunk timeout — so the first play after a fresh client
+   connection was silent until the race happened to resolve. Fix: open the FIFO
+   **blocking**; it returns the instant `snapserver` next opens the read end
+   (~80ms) and we then hold a persistent writer. (This supersedes the
+   "non-blocking open then `clear_nonblocking`" direction floated in note 4 above —
+   blocking from the open is simpler and removes the race.)
+
+**Open follow-ups (need to be taken care of — not yet done):**
+
+- **`snapclient` binds ALSA `sysdefault` despite the `-s default` arg.** The agent's
+  `SnapclientSupervisor` passes `-s default`, but `snapclient` still logs
+  `device: sysdefault`. It worked on the test Pi, but `sysdefault` is HDMI-only
+  card 0 on many Pis (ALSA error 524 with nothing plugged into HDMI), so this will
+  bite on other hardware. Verify the `-s` arg actually reaches `snapclient` and
+  resolves to the intended sink (`AUDIOSHARE_SOUND_DEVICE` override exists).
+- **Stale `connected:false` `snapclient` entries accumulate in `snapserver`.** Each
+  dongle reconnect (and any hostID change) leaves a ghost client in
+  `Server.GetStatus`; the list grows across runs. Cosmetic today, but should be
+  reaped / deduped before the iOS picker surfaces snapserver state directly.
 
 ---
 

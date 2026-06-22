@@ -127,6 +127,29 @@ fn monitor_loop(binary: &str, args: &[String], stop: &AtomicBool, child: &Mutex<
     }
 }
 
+/// Env var overriding the ALSA output device `snapclient` plays to.
+const SOUND_DEVICE_ENV: &str = "AUDIOSHARE_SOUND_DEVICE";
+
+/// ALSA output device we hand `snapclient` (`-s`).
+///
+/// We pass `default` rather than letting `snapclient` fall back to its own
+/// `sysdefault`, because on a typical Pi `sysdefault` resolves to **card 0 /
+/// HDMI** — which fails to open (ALSA error 524) when no HDMI sink is plugged
+/// in. `default` resolves to the system sound server (PipeWire on current
+/// Raspberry Pi OS), so output routing — HDMI when connected, else the analog
+/// jack — is delegated to PipeWire/WirePlumber, which also gives us the seam to
+/// make the active output app-switchable later (by changing PipeWire's default
+/// sink, no `snapclient` restart needed). Overridable via [`SOUND_DEVICE_ENV`]
+/// for hardware where the default isn't right (e.g. `plughw:CARD=Headphones`).
+const DEFAULT_SOUND_DEVICE: &str = "default";
+
+fn sound_device() -> String {
+    std::env::var(SOUND_DEVICE_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SOUND_DEVICE.to_string())
+}
+
 /// Build the `snapclient` argument list for a hub `snapserver`.
 fn client_args(host: &str, port: u16, host_id: &str) -> Vec<String> {
     vec![
@@ -138,6 +161,10 @@ fn client_args(host: &str, port: u16, host_id: &str) -> Vec<String> {
         // this client by the same id it registered as an output.
         "--hostID".to_string(),
         host_id.to_string(),
+        // Pick an output device explicitly so we don't fall back to HDMI-only
+        // `sysdefault`; see DEFAULT_SOUND_DEVICE.
+        "-s".to_string(),
+        sound_device(),
     ]
 }
 
@@ -154,14 +181,40 @@ fn spawn_snapclient(binary: &str, args: &[String]) -> Result<Child, String> {
 mod tests {
     use super::*;
 
+    // One test for everything touching SOUND_DEVICE_ENV: process env is global,
+    // so splitting these across cargo's parallel test runner would race.
     #[test]
-    fn client_args_carry_host_port_and_id() {
-        let args = client_args("192.168.1.10", 1704, "dongle-abc");
+    fn client_args_and_sound_device_resolution() {
+        let prev = std::env::var(SOUND_DEVICE_ENV).ok();
+
+        // No override → default device, appended after the host/port/id args.
+        std::env::remove_var(SOUND_DEVICE_ENV);
         assert_eq!(
-            args,
+            client_args("192.168.1.10", 1704, "dongle-abc"),
             vec![
-                "-h", "192.168.1.10", "-p", "1704", "--hostID", "dongle-abc"
+                "-h",
+                "192.168.1.10",
+                "-p",
+                "1704",
+                "--hostID",
+                "dongle-abc",
+                "-s",
+                DEFAULT_SOUND_DEVICE,
             ]
         );
+
+        // Override is honored verbatim.
+        std::env::set_var(SOUND_DEVICE_ENV, "plughw:CARD=Headphones,DEV=0");
+        assert_eq!(sound_device(), "plughw:CARD=Headphones,DEV=0");
+
+        // Blank/whitespace falls back to the default rather than passing an
+        // empty `-s` that snapclient would reject.
+        std::env::set_var(SOUND_DEVICE_ENV, "  ");
+        assert_eq!(sound_device(), DEFAULT_SOUND_DEVICE);
+
+        match prev {
+            Some(v) => std::env::set_var(SOUND_DEVICE_ENV, v),
+            None => std::env::remove_var(SOUND_DEVICE_ENV),
+        }
     }
 }

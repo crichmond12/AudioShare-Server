@@ -6,6 +6,13 @@ build_rust() {
     ./env_exec.sh cargo build
 }
 
+# Function to build the dongle agent (multi-room Change 5). Cross-compiles the
+# `dongle_agent` workspace binary in the same Docker toolchain as the hub.
+build_agent() {
+		ssh pi "rm -f ./dongle_agent"
+    ./env_exec.sh cargo build -p dongle_agent
+}
+
 # Function to build Go project
 build_go() {
 		ssh pi "rm -f ./audioshare_site"
@@ -29,6 +36,12 @@ send_rust_file() {
     scp target/debug/audio_share pi:./audioshare_device
 }
 
+# Function to send the dongle agent binary
+send_agent_file() {
+    echo "Sending dongle agent binary to the target..."
+    scp target/debug/dongle_agent pi:./dongle_agent
+}
+
 # Function to send Go binary
 send_go_file() {
     echo "Sending Go binary to the target..."
@@ -45,6 +58,10 @@ elif [ "$1" == "device" ]; then
     echo "Building and sending Rust application..."
     build_rust
     send_rust_file
+elif [ "$1" == "agent" ]; then
+    echo "Building and sending dongle agent..."
+    build_agent
+    send_agent_file
 else
     echo "Building and sending both applications..."
     # Build both projects in parallel

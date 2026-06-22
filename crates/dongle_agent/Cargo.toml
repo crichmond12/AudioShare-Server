@@ -25,3 +25,6 @@ mdns-sd = "0.11.1"
 local-ip-address = "0.6.1"
 # Stable, persisted dongle identity (becomes the hub's OutputId).
 uuid = { version = "1.8.0", features = ["v4"] }
+# prctl(PR_SET_PDEATHSIG) so the avahi advert child dies with the agent even on a
+# signal/SIGKILL that skips Rust destructors (see assignment.rs).
+libc = "0.2"

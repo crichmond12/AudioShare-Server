@@ -31,8 +31,10 @@ pub struct Output {
     pub id: OutputId,
     /// Human-facing name / location, e.g. "Kitchen".
     pub name: String,
-    /// Where PCM for this output goes. The local device or a network sink.
-    pub sink: Arc<dyn AudioSink>,
+    /// Where PCM for this output goes. `Some` for the local device; `None` for
+    /// dongle outputs, which are grouped in snapserver rather than decoded into
+    /// individually.
+    pub sink: Option<Arc<dyn AudioSink>>,
     /// Whether the output is currently reachable. Offline outputs stay in the
     /// registry (so their zone membership/name persists) but are skipped when
     /// resolving sinks for playback.
@@ -90,7 +92,7 @@ impl OutputRegistry {
         outputs
             .get(id)
             .filter(|o| o.online)
-            .map(|o| Arc::clone(&o.sink))
+            .and_then(|o| o.sink.clone())
     }
 
     /// Whether an output with this id is currently registered (online or not).
@@ -140,7 +142,7 @@ mod tests {
         Output {
             id: id.to_string(),
             name: id.to_string(),
-            sink: Arc::new(NullSink),
+            sink: Some(Arc::new(NullSink)),
             online,
         }
     }
@@ -170,6 +172,21 @@ mod tests {
 
         registry.set_online("kitchen", false);
         assert!(registry.sink("kitchen").is_none());
+    }
+
+    #[test]
+    fn output_without_sink_never_resolves() {
+        let registry = OutputRegistry::new();
+        registry.register(Output {
+            id: "dongle-1".to_string(),
+            name: "Kitchen".to_string(),
+            sink: None,
+            online: true,
+        });
+        // Registered + online, but no direct sink: dongles are grouped in
+        // snapserver, not decoded into individually.
+        assert!(registry.sink("dongle-1").is_none());
+        assert!(registry.contains("dongle-1"));
     }
 
     #[test]
