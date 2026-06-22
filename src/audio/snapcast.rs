@@ -60,9 +60,6 @@ pub fn stream_id(index: usize) -> String {
     format!("as-{index}")
 }
 
-/// Kept for the ignored single-stream smoke test: stream 0's FIFO.
-pub const DEFAULT_FIFO_PATH: &str = "/tmp/audioshare-snapfifo-0";
-
 /// How long the supervisor waits before relaunching a `snapserver` that exited.
 const SNAPSERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
 

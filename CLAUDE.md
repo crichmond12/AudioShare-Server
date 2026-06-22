@@ -169,7 +169,7 @@ The `task` field is parsed into `commands::Task` and routed by `commands::dispat
 
 **Zone CRUD tasks (hub-side shipped, iOS mirror pending own spec):**
 - `create_zone` — `data: { "name": "<display name>" }` → `ENGINE.create_zone(name)`; success `data: { "zone": "<new-id>" }`.
-- `delete_zone` — `data: { "zone": "<id>" }` → `ENGINE.delete_zone(zone)`; stops any playback, frees the pool slot, returns dongles to their auto-zones; errors: `unknown_zone`.
+- `delete_zone` — `data: { "zone": "<id>" }` → `ENGINE.delete_zone(zone)`; stops any playback and frees the pool slot. Member dongles remain reachable via their own auto-zones (keyed by dongle id), which are independent entries and are not removed; errors: `unknown_zone`.
 - `rename_zone` — `data: { "zone": "<id>", "name": "<new name>" }` → `ENGINE.rename_zone(zone, name)`; errors: `unknown_zone`.
 - `set_zone_outputs` — `data: { "zone": "<id>", "outputs": ["<output-id>", ...] }` → `ENGINE.set_zone_outputs(zone, outputs)`; enforces all-dongle or all-local (never mixed); errors: `unknown_zone`, `unknown_output`, `mixed_zone_unsupported`.
 

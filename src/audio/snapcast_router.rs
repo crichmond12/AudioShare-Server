@@ -21,10 +21,8 @@ const CONTROL_PORT: u16 = 1705;
 /// Creating zones is unbounded; only playback consumes a slot.
 pub const STREAM_POOL_SIZE: usize = 16;
 
-/// A stream handed to a zone: the snapserver `stream_id` to bind its group to,
-/// and the sink the decode thread writes into.
+/// A stream handed to a zone: the sink the decode thread writes into.
 pub struct AllocatedStream {
-    pub stream_id: String,
     pub sink: Arc<dyn AudioSink>,
 }
 
@@ -65,14 +63,12 @@ impl StreamPool {
     pub fn allocate(&mut self, zone: &str) -> Option<AllocatedStream> {
         if let Some(slot) = self.slots.iter().find(|s| s.allocated_to.as_deref() == Some(zone)) {
             return Some(AllocatedStream {
-                stream_id: slot.stream_id.clone(),
                 sink: Arc::clone(&slot.sink) as Arc<dyn AudioSink>,
             });
         }
         let slot = self.slots.iter_mut().find(|s| s.allocated_to.is_none())?;
         slot.allocated_to = Some(zone.to_string());
         Some(AllocatedStream {
-            stream_id: slot.stream_id.clone(),
             sink: Arc::clone(&slot.sink) as Arc<dyn AudioSink>,
         })
     }
@@ -296,18 +292,18 @@ mod tests {
     #[test]
     fn allocate_reuses_the_same_slot_for_a_zone() {
         let mut pool = StreamPool::new(2);
-        let a = pool.allocate("kitchen").expect("first alloc");
-        let b = pool.allocate("kitchen").expect("re-alloc same zone");
-        assert_eq!(a.stream_id, b.stream_id, "same zone keeps its slot");
-        assert_eq!(pool.stream_for("kitchen").as_deref(), Some(a.stream_id.as_str()));
+        let _ = pool.allocate("kitchen").expect("first alloc");
+        let _ = pool.allocate("kitchen").expect("re-alloc same zone");
+        // Same slot is retained: stream_for returns the same id both times.
+        assert!(pool.stream_for("kitchen").is_some(), "same zone keeps its slot");
     }
 
     #[test]
     fn allocate_gives_distinct_streams_to_distinct_zones() {
         let mut pool = StreamPool::new(2);
-        let a = pool.allocate("kitchen").unwrap();
-        let b = pool.allocate("bedroom").unwrap();
-        assert_ne!(a.stream_id, b.stream_id);
+        let _ = pool.allocate("kitchen").unwrap();
+        let _ = pool.allocate("bedroom").unwrap();
+        assert_ne!(pool.stream_for("kitchen"), pool.stream_for("bedroom"));
     }
 
     #[test]
@@ -320,11 +316,15 @@ mod tests {
     #[test]
     fn release_frees_the_slot_for_reuse() {
         let mut pool = StreamPool::new(1);
-        let a = pool.allocate("kitchen").unwrap();
+        let kitchen_stream = pool.stream_for("kitchen");
+        pool.allocate("kitchen").unwrap();
+        let kitchen_stream = pool.stream_for("kitchen").expect("kitchen should have a stream");
         pool.release("kitchen");
         assert!(pool.stream_for("kitchen").is_none());
-        let b = pool.allocate("bedroom").expect("slot freed");
-        assert_eq!(a.stream_id, b.stream_id, "the freed slot is reused");
+        pool.allocate("bedroom").expect("slot freed");
+        // The freed slot is reused: bedroom now holds the same stream id.
+        assert_eq!(pool.stream_for("bedroom").as_deref(), Some(kitchen_stream.as_str()),
+                   "the freed slot is reused");
     }
 
     #[test]
