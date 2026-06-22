@@ -64,6 +64,9 @@ impl<'connection> Connection<'connection> {
         if self.send_outputs().await.is_err() {
             return Ok(true);
         }
+        if self.send_zones().await.is_err() {
+            return Ok(true);
+        }
 
         loop {
             let read_result = tokio::select! {
@@ -74,6 +77,9 @@ impl<'connection> Connection<'connection> {
                 // send the full list, so re-pushing once catches up.
                 _ = outputs_changed.recv() => {
                     if self.send_outputs().await.is_err() {
+                        return Ok(true);
+                    }
+                    if self.send_zones().await.is_err() {
                         return Ok(true);
                     }
                     continue;
@@ -141,6 +147,7 @@ impl<'connection> Connection<'connection> {
             // `list_outputs` re-pushes the speaker list (it needs the connection,
             // so it's handled here rather than in the stateless `dispatch`).
             Some("list_outputs") => return self.send_outputs().await,
+            Some("list_zones") => return self.send_zones().await,
             Some(task_str) => {
                 let task = commands::Task::parse(task_str);
                 commands::dispatch(task, &request["data"])
@@ -165,6 +172,20 @@ impl<'connection> Connection<'connection> {
             .map(|(zone, name, online)| json!({ "zone": zone, "name": name, "online": online }))
             .collect();
         let response = TaskResponse::accepted("outputs", Some(json!({ "outputs": outputs })));
+        self.send_encrypted(&response.to_json()).await
+    }
+
+    /// Push the current zone definitions (id, name, member outputs, playing) so a
+    /// grouping UI can render membership. Additive to the flat `outputs` push.
+    async fn send_zones(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let zones: Vec<serde_json::Value> = ENGINE
+            .list_zones()
+            .into_iter()
+            .map(|z| json!({
+                "zone": z.zone, "name": z.name, "outputs": z.outputs, "playing": z.playing
+            }))
+            .collect();
+        let response = TaskResponse::accepted("zones", Some(json!({ "zones": zones })));
         self.send_encrypted(&response.to_json()).await
     }
 
