@@ -70,8 +70,18 @@ impl Pipeline {
 
 /// A zone's membership plus its current in-flight playback (if any).
 struct ZonePlayback {
+    name: String,
     outputs: Vec<OutputId>,
     current: Option<Pipeline>,
+}
+
+/// A zone as reported to clients: id, label, member output ids, and whether it
+/// currently has playback.
+pub struct ZoneView {
+    pub zone: ZoneId,
+    pub name: String,
+    pub outputs: Vec<String>,
+    pub playing: bool,
 }
 
 /// The multi-room playback engine. Shared process-wide via [`ENGINE`].
@@ -93,6 +103,7 @@ impl Engine {
         zones.insert(
             DEFAULT_ZONE.to_string(),
             ZonePlayback {
+                name: HUB_DISPLAY_NAME.to_string(),
                 outputs: vec![LOCAL_OUTPUT_ID.to_string()],
                 current: None,
             },
@@ -274,6 +285,7 @@ impl Engine {
         });
         let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
         zones.entry(id.to_string()).or_insert_with(|| ZonePlayback {
+            name: name.to_string(),
             outputs: vec![id.to_string()],
             current: None,
         });
@@ -285,6 +297,78 @@ impl Engine {
     pub fn dongle_offline(&self, id: &str) {
         self.registry.set_online(id, false);
         self.notify_outputs_changed();
+    }
+
+    /// Create a new, empty, user-named zone and return its generated id.
+    /// Duplicate names are allowed — the id is the identity.
+    pub fn create_zone(&self, name: &str) -> ZoneId {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.zones.lock().expect("engine zones mutex poisoned").insert(
+            id.clone(),
+            ZonePlayback { name: name.to_string(), outputs: Vec::new(), current: None },
+        );
+        self.notify_outputs_changed();
+        id
+    }
+
+    /// Delete a zone, stopping its playback and freeing its Snapcast stream.
+    pub fn delete_zone(&self, zone: &str) -> Result<(), String> {
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        let removed = zones.remove(zone).ok_or_else(|| "unknown_zone".to_string())?;
+        drop(zones);
+        if let Some(pipeline) = removed.current {
+            pipeline.shutdown();
+        }
+        self.snapcast.release_zone(zone);
+        self.notify_outputs_changed();
+        Ok(())
+    }
+
+    /// Rename a zone's label. Duplicate names are allowed.
+    pub fn rename_zone(&self, zone: &str, name: &str) -> Result<(), String> {
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        let z = zones.get_mut(zone).ok_or_else(|| "unknown_zone".to_string())?;
+        z.name = name.to_string();
+        drop(zones);
+        self.notify_outputs_changed();
+        Ok(())
+    }
+
+    /// Set a zone's member outputs (the single membership mutator). Enforces that
+    /// a zone is all-dongle or all-local, never mixed, and that every id is a
+    /// known output.
+    pub fn set_zone_outputs(&self, zone: &str, outputs: &[String]) -> Result<(), String> {
+        let has_local = outputs.iter().any(|o| o == LOCAL_OUTPUT_ID);
+        let has_dongle = outputs.iter().any(|o| o != LOCAL_OUTPUT_ID);
+        if has_local && has_dongle {
+            return Err("mixed_zone_unsupported".to_string());
+        }
+        for id in outputs {
+            if id != LOCAL_OUTPUT_ID && !self.registry.contains(id) {
+                return Err("unknown_output".to_string());
+            }
+        }
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        let z = zones.get_mut(zone).ok_or_else(|| "unknown_zone".to_string())?;
+        z.outputs = outputs.to_vec();
+        drop(zones);
+        self.snapcast.reconcile_now();
+        self.notify_outputs_changed();
+        Ok(())
+    }
+
+    /// Snapshot of all zones for the client `zones` push.
+    pub fn list_zones(&self) -> Vec<ZoneView> {
+        let zones = self.zones.lock().expect("engine zones mutex poisoned");
+        zones
+            .iter()
+            .map(|(id, z)| ZoneView {
+                zone: id.clone(),
+                name: z.name.clone(),
+                outputs: z.outputs.clone(),
+                playing: z.current.is_some(),
+            })
+            .collect()
     }
 
     /// Re-run Snapcast reconcile (fired by snapserver client-connect events).
@@ -497,6 +581,69 @@ mod tests {
 
         thread::sleep(Duration::from_secs(3));
         engine.stop(DEFAULT_ZONE);
+    }
+
+    #[test]
+    fn create_then_set_outputs_and_list() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_dongle_output("d2", "Bedroom");
+
+        let zone = engine.create_zone("Upstairs");
+        engine.set_zone_outputs(&zone, &["d1".to_string(), "d2".to_string()]).expect("set");
+
+        let view = engine.list_zones().into_iter().find(|z| z.zone == zone).expect("zone listed");
+        assert_eq!(view.name, "Upstairs");
+        assert_eq!(view.outputs, vec!["d1".to_string(), "d2".to_string()]);
+        assert!(!view.playing);
+    }
+
+    #[test]
+    fn duplicate_names_are_allowed_with_distinct_ids() {
+        let engine = Engine::new();
+        let a = engine.create_zone("Group");
+        let b = engine.create_zone("Group");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn set_zone_outputs_rejects_mixing_local_and_dongle() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        let zone = engine.create_zone("Mix");
+        let err = engine
+            .set_zone_outputs(&zone, &["local".to_string(), "d1".to_string()])
+            .unwrap_err();
+        assert_eq!(err, "mixed_zone_unsupported");
+    }
+
+    #[test]
+    fn set_zone_outputs_rejects_unknown_output() {
+        let engine = Engine::new();
+        let zone = engine.create_zone("Z");
+        let err = engine.set_zone_outputs(&zone, &["ghost".to_string()]).unwrap_err();
+        assert_eq!(err, "unknown_output");
+    }
+
+    #[test]
+    fn set_outputs_unknown_zone_errors() {
+        let engine = Engine::new();
+        let err = engine.set_zone_outputs("nope", &[]).unwrap_err();
+        assert_eq!(err, "unknown_zone");
+    }
+
+    #[test]
+    fn rename_and_delete_zone() {
+        let engine = Engine::new();
+        let zone = engine.create_zone("Old");
+        engine.rename_zone(&zone, "New").expect("rename");
+        assert_eq!(
+            engine.list_zones().into_iter().find(|z| z.zone == zone).unwrap().name,
+            "New"
+        );
+        engine.delete_zone(&zone).expect("delete");
+        assert!(engine.list_zones().into_iter().all(|z| z.zone != zone));
+        assert_eq!(engine.delete_zone(&zone).unwrap_err(), "unknown_zone");
     }
 
     // FanOut forwards writes to every member sink.
