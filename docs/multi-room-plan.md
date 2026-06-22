@@ -493,6 +493,31 @@ the iOS sub-step 2.5 path regardless:
 advertise via Apple's `dns_sd` C API on macOS instead of `mdns-sd` — not worth
 it for a Linux-only production target.)
 
+#### Sub-step 3 — landed (2026-06-21)
+
+Per-zone independent Snapcast streams + hub-driven grouping. Builds directly on the sub-step 2 architecture; no protocol or crate layout changes. Update `CLAUDE.md` (protocol/state source of truth) when this section changes.
+
+**What it delivers.** Each dongle zone plays its own independent audio stream; a user-created multi-dongle zone plays one synchronized stream across all members (Snapcast clock-aligns them). Zone CRUD (create/rename/delete zones, set membership) is live both in the engine and over the wire. The manual `Group.SetStream` bring-up workaround from note #2 is gone — the reconciler handles it automatically.
+
+**`SnapcastSink` backpressure fix (sub-step 3.1, `audio/snapcast.rs`).** Prior to this step the sink opened the FIFO non-blocking and dropped samples when the pipe was full, causing choppy audio (KAN-23 Snapcast variant). Fix: keep the blocking open (already landed as a cold-start fix in sub-step 2), and leave the file descriptor blocking thereafter so subsequent writes naturally pace the decode thread instead of dropping overflow. One `SnapcastSink` instance per pool FIFO (no longer a single shared sink).
+
+**Multi-stream pool (sub-step 3.2, `audio/snapcast.rs`).** `SnapserverSupervisor` now launches `snapserver` with `STREAM_POOL_SIZE = 16` pipe streams named `as-0` … `as-15`, each reading its own FIFO at `/tmp/audioshare-snapfifo-{k}`. A `StreamPool` tracks which slot is allocated to which zone. Pool is sized for concurrent *playing* zones, not total dongles — creating zones is unbounded; playing zones consume a slot.
+
+**JSON-RPC control client (sub-step 3.3, `audio/snapcast_control.rs`).** `CommandConn` maintains a persistent TCP connection to `snapserver`'s control port (`127.0.0.1:1705`), speaking newline-delimited JSON-RPC 2.0. Requests used: `Server.GetStatus`, `Group.SetClients`, `Group.SetStream`. `EventListener` reads `snapserver` push notifications (`Client.OnConnect`, `Client.OnDisconnect`, `Server.OnUpdate`) on the same socket and signals the reconciler. Both are defined behind a `SnapcastControl` trait for unit testing against a mock.
+
+**`SnapcastRouter` + desired-state reconciler (sub-step 3.4, `audio/snapcast_router.rs`).** The `SnapcastRouter` is the engine's single seam into Snapcast — the engine never speaks JSON-RPC itself. It owns the `SnapserverSupervisor`, the `SnapcastControl` client, and the stream pool. API:
+- `sink_for_zone(zone, dongle_ids)` — allocates a free pool slot (`no_free_stream` if all 16 are in use), records desired grouping (zone → stream, dongle → zone), fires a reconcile, returns the slot's `SnapcastSink` to the decode thread.
+- `release_zone(zone)` — frees the pool slot; clients stay grouped on the now-idle (silent) FIFO to avoid churn.
+- `reconcile_now()` (idempotent) — for each active zone: `GetStatus` → find the zone's dongles' clients → `Group.SetClients(group, client_ids)` → `Group.SetStream(group, slot_stream_id)`. Also fired on every `Client.OnConnect`/`OnDisconnect` notification, so a late-connecting `snapclient` is pulled onto the right stream automatically.
+
+**Engine changes (sub-step 3.4, `audio/engine.rs`).** The shared `Arc<SnapcastSink>` field is replaced by a `SnapcastRouter`. Dongle `Output`s carry `sink: None` — `Output.sink` is now `Option<Arc<dyn AudioSink>>`; only the local cpal output carries a real sink. The router allocates a per-zone FIFO sink at play time. Zone routing in `play`: all-local → existing single/FanOut local path (unchanged); any-dongle (enforced all-dongle) → `router.sink_for_zone(...)`. Mixed local+dongle → blocked at `set_zone_outputs` time (`mixed_zone_unsupported`) and defended inside `zone_sink` as well.
+
+**Zone CRUD + wire protocol (sub-step 3.5).** New engine methods: `create_zone(name) -> ZoneId` (generates a UUID id, empty membership; duplicate names allowed), `delete_zone(zone)`, `rename_zone(zone, name)`, `set_zone_outputs(zone, [output_ids])` (enforces all-dongle or all-local). All four are exposed as wire tasks routed by `commands::dispatch()`. New wire push: `zones` message on every `OUTPUTS_CHANGED` trigger and on `list_zones` pull — carries `{ zone, name, outputs, playing }` per zone (full detail in `CLAUDE.md` protocol section). The flat `outputs` push is retained for iOS back-compat.
+
+**Device-free tests cover:** stream pool allocate/release/exhaustion; reconciler logic against a mock `SnapcastControl`; `SnapcastControl` JSON-RPC request/response + notification parsing against a loopback mock snapserver; engine zone CRUD + constraint enforcement; `SnapcastSink` backpressure via a real temp FIFO + draining reader thread. Demo-gated path (needs `snapserver` + 2× `snapclient` + audio hardware): two dongles → independent audio; `create_zone` + `set_zone_outputs` grouping both → synchronized audio; late-joining dongle auto-assigned to the correct stream.
+
+**Still deferred:** iOS grouping UI (own spec; wire contract frozen in `CLAUDE.md`); auth on the dongle registration/assignment channels; general local-output jitter buffer (KAN-23 base, not the Snapcast variant).
+
 #### Bring-up notes (first real laptop-as-dongle demo, 2026-06-20)
 
 The sub-step 2.3 path was proven end-to-end (Pi hub → laptop running the agent +
@@ -509,15 +534,7 @@ doesn't rediscover them:
    flashable-image setup** — it'll bite every user. (A more self-contained fix:
    have the hub launch `snapserver` with an explicit minimal config so it never
    collides — worth considering for packaging.)
-2. **New `snapclient`s land on the wrong stream.** `snapserver.conf` ships a
-   `default` stream; a freshly-connected client is placed in a group bound to
-   `default`, **not** the hub's `AudioShare` pipe stream — so even with audio
-   flowing into `AudioShare`, the client hears nothing. Manual workaround via the
-   control RPC on 1705:
-   `Group.SetStream {id:<group>, stream_id:"AudioShare"}` (find `<group>` from
-   `Server.GetStatus`). **This is exactly what sub-step 3 automates** — the hub
-   programs snapserver groups/streams from zone membership over JSON-RPC so it's
-   never manual. The manual RPC is also not persistent across reconnects.
+2. ~~**New `snapclient`s land on the wrong stream.**~~ **Retired — automated by sub-step 3 reconciler.** Previously, `snapserver.conf`'s `default` stream trapped freshly-connected clients, requiring a manual `Group.SetStream {id:<group>, stream_id:"AudioShare"}` via the control RPC on 1705. The sub-step 3 desired-state reconciler now handles this automatically: every `Client.OnConnect` notification triggers a reconcile that calls `Group.SetClients` + `Group.SetStream` to pull the client onto the correct pool stream. No manual intervention needed; the workaround is not persistent across reconnects and is gone.
 3. **iOS hardcoded `zone:"default"`.** `Library.swift` sent every `play`/`stop`
    with `zone:"default"`, so playback always hit the hub's local output, never a
    dongle. Added a free-text **Zone** field (type a dongle UUID to target it) as a
