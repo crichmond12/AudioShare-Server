@@ -12,7 +12,8 @@
 //! demo-gated test; per-zone supervision + engine wiring is Slice 2.
 
 use std::ffi::CString;
-use std::io::ErrorKind;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -20,6 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use crate::audio::decode::{mix_planar, ResamplePipeline};
+use crate::audio::sink::AudioSink;
 
 /// AirPlay always delivers CD audio: 44.1 kHz, 16-bit, stereo.
 pub const AIRPLAY_SAMPLE_RATE: u32 = 44_100;
@@ -181,6 +185,67 @@ fn spawn_shairport(binary: &str, config_path: &Path) -> Result<Child, String> {
         .map_err(|e| format!("failed to spawn shairport-sync `{binary}`: {e}"))
 }
 
+/// Read one AirPlay session from `fifo` into `sink`: open the FIFO (blocking
+/// until shairport-sync opens the write end on session start), then read until
+/// EOF (session end) or `stop`. Returns `Ok(())` on a clean EOF.
+fn pump_one_session(
+    fifo: &Path,
+    sink: &dyn AudioSink,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    // Blocking open: returns once a writer (shairport) is present.
+    let mut file = File::open(fifo)
+        .map_err(|e| format!("open airplay fifo {} failed: {e}", fifo.display()))?;
+
+    let mut pipeline = ResamplePipeline::new(
+        AIRPLAY_SAMPLE_RATE,
+        AIRPLAY_CHANNELS,
+        sink.sample_rate(),
+        sink.channels() as usize,
+    )?;
+
+    let frame_bytes = AIRPLAY_CHANNELS * 2;
+    let mut remainder: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let n = match file.read(&mut buf) {
+            Ok(0) => return Ok(()), // writer closed: session ended
+            Ok(n) => n,
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("airplay fifo read error: {e}")),
+        };
+
+        remainder.extend_from_slice(&buf[..n]);
+        let whole = (remainder.len() / frame_bytes) * frame_bytes;
+        if whole == 0 {
+            continue;
+        }
+        let planar = i16le_to_planar_f32(&remainder[..whole], AIRPLAY_CHANNELS);
+        remainder.drain(..whole);
+
+        let mixed = mix_planar(&planar, sink.channels() as usize);
+        pipeline.push_and_drain(mixed, sink);
+    }
+}
+
+/// Continuously receive AirPlay audio from `fifo` into `sink` until `stop` is
+/// set: each session is one [`pump_one_session`] cycle; between sessions the
+/// blocking FIFO open parks the thread until the next sender connects.
+pub fn pump_fifo_to_sink(
+    fifo: &Path,
+    sink: &dyn AudioSink,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    while !stop.load(Ordering::Relaxed) {
+        pump_one_session(fifo, sink, stop)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +290,67 @@ mod tests {
     fn fifo_path_is_indexed() {
         assert_eq!(fifo_path(0), PathBuf::from("/tmp/audioshare-airplay-0.pcm"));
         assert_eq!(fifo_path(3), PathBuf::from("/tmp/audioshare-airplay-3.pcm"));
+    }
+
+    #[test]
+    fn pump_passes_through_at_native_rate() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        // A sink at AirPlay's native rate/channels: no resampling, exact passthrough.
+        struct Capture(std::sync::Mutex<Vec<f32>>);
+        impl AudioSink for Capture {
+            fn sample_rate(&self) -> u32 { AIRPLAY_SAMPLE_RATE }
+            fn channels(&self) -> u16 { AIRPLAY_CHANNELS as u16 }
+            fn write(&self, samples: &[f32]) {
+                self.0.lock().unwrap().extend_from_slice(samples);
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!("as-airplay-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo failed");
+
+        // Known interleaved stereo samples -> s16le bytes.
+        let samples: Vec<f32> = vec![0.0, 0.5, -0.5, 0.25, 1.0, -1.0];
+        let mut bytes = Vec::new();
+        for &s in &samples {
+            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Writer thread: open the FIFO for writing (blocks until the reader opens
+        // the read end), write all bytes, then close to signal EOF.
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&writer_path).unwrap();
+            f.write_all(&bytes).unwrap();
+            // Dropping `f` closes the write end -> reader sees EOF.
+        });
+
+        let sink = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Reader thread: pump until the first session ends, then stop.
+        let reader_sink = Arc::clone(&sink);
+        let reader_stop = Arc::clone(&stop);
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            // Stop after the first EOF so the test terminates: a tiny wrapper that
+            // pumps one session. We set stop right after the writer finishes.
+            let _ = pump_one_session(&reader_path, reader_sink.as_ref(), &reader_stop);
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let got = sink.0.lock().unwrap().clone();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got.len(), samples.len(), "all frames delivered");
+        for (g, s) in got.iter().zip(samples.iter()) {
+            assert!((g - s).abs() < 1e-3, "passthrough sample mismatch: {g} vs {s}");
+        }
     }
 }
