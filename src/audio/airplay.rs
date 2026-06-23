@@ -353,4 +353,39 @@ mod tests {
             assert!((g - s).abs() < 1e-3, "passthrough sample mismatch: {g} vs {s}");
         }
     }
+
+    // Live end-to-end check (opt-in: needs the classic `shairport-sync` binary and
+    // audio hardware). Proves Slice 1's receive path with zero engine wiring:
+    //   cargo test audio::airplay::tests::receives_airplay_briefly -- --ignored --nocapture
+    // While it runs, on your iPhone/Mac open the AirPlay menu, pick the receiver
+    // named "Audio Share (Hub)", and play something. You should hear it from this
+    // machine's default output for ~30s.
+    #[test]
+    #[ignore]
+    fn receives_airplay_briefly() {
+        use crate::audio::output::AudioOutput;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let fifo = fifo_path(0);
+        let _server = ShairportSupervisor::spawn("Audio Share (Hub)", 5000, &fifo)
+            .expect("shairport-sync should spawn (is the classic build installed?)");
+
+        let output = Arc::new(AudioOutput::new().expect("open default output device"));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let pump_output = Arc::clone(&output);
+        let pump_stop = Arc::clone(&stop);
+        let pump_fifo = fifo.clone();
+        let worker = thread::spawn(move || {
+            pump_fifo_to_sink(&pump_fifo, pump_output.as_ref(), &pump_stop)
+        });
+
+        thread::sleep(Duration::from_secs(30));
+        stop.store(true, Ordering::Relaxed);
+        // The pump may be parked in a blocking FIFO read/open; this test does not
+        // join it (the process exits at test end). Stop responsiveness during an
+        // active read is a Slice 2 concern (session tracking via the metadata pipe).
+        drop(worker);
+    }
 }
