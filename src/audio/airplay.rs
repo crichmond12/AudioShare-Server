@@ -11,9 +11,31 @@
 //! This mirrors `audio::snapcast` in reverse. Slice 1 proves the path with a
 //! demo-gated test; per-zone supervision + engine wiring is Slice 2.
 
+use std::ffi::CString;
+use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
 /// AirPlay always delivers CD audio: 44.1 kHz, 16-bit, stereo.
 pub const AIRPLAY_SAMPLE_RATE: u32 = 44_100;
 pub const AIRPLAY_CHANNELS: usize = 2;
+
+/// Base path for the per-receiver audio FIFOs shairport-sync writes.
+const FIFO_PATH_BASE: &str = "/tmp/audioshare-airplay";
+/// Path of the shairport-sync config file the supervisor writes per receiver.
+const CONFIG_PATH_BASE: &str = "/tmp/audioshare-shairport";
+/// How long to wait before relaunching a shairport-sync that exited.
+const SHAIRPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
+
+/// Path of the audio FIFO backing receiver `index`.
+pub fn fifo_path(index: usize) -> PathBuf {
+    PathBuf::from(format!("{FIFO_PATH_BASE}-{index}.pcm"))
+}
 
 /// Convert interleaved little-endian `s16` `bytes` into `channels` planar `f32`
 /// channels in `[-1.0, 1.0]`. A trailing partial frame (fewer than
@@ -30,6 +52,133 @@ pub(crate) fn i16le_to_planar_f32(bytes: &[u8], channels: usize) -> Vec<Vec<f32>
         }
     }
     planar
+}
+
+/// Build a minimal libconfig `shairport-sync` config: a named classic-AirPlay
+/// receiver on `port` whose `pipe` backend writes raw PCM to `fifo_path`.
+fn shairport_config(name: &str, port: u16, fifo_path: &Path) -> String {
+    format!(
+        "general =\n{{\n  name = \"{name}\";\n  port = {port};\n}};\n\n\
+         pipe =\n{{\n  name = \"{}\";\n}};\n",
+        fifo_path.display()
+    )
+}
+
+/// Create the FIFO at `path` if it does not already exist (mode 0o600).
+fn ensure_fifo(path: &Path) -> Result<(), String> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| format!("bad fifo path {}: {e}", path.display()))?;
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != ErrorKind::AlreadyExists {
+            return Err(format!("mkfifo {} failed: {err}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Supervises one classic `shairport-sync` process writing PCM to a FIFO.
+///
+/// A thin supervisor (the same shape as `snapcast::SnapserverSupervisor`):
+/// ensures the FIFO + config exist, launches `shairport-sync -c <conf> -o pipe`,
+/// relaunches it if it exits, and kills it on drop. Per the plan, Snapcast and
+/// AirPlay alike stay swappable implementation details behind the AudioSink seam.
+pub struct ShairportSupervisor {
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    monitor: Option<JoinHandle<()>>,
+}
+
+impl ShairportSupervisor {
+    /// Spawn `shairport-sync` (resolved from `PATH`) as a receiver named `name`
+    /// on `port`, writing PCM to `fifo`.
+    pub fn spawn(name: &str, port: u16, fifo: &Path) -> Result<Self, String> {
+        Self::spawn_with("shairport-sync", name, port, fifo)
+    }
+
+    /// Like [`spawn`](Self::spawn) but with an explicit binary (for tests/dev).
+    pub fn spawn_with(
+        binary: impl Into<String>,
+        name: &str,
+        port: u16,
+        fifo: &Path,
+    ) -> Result<Self, String> {
+        let binary = binary.into();
+        ensure_fifo(fifo)?;
+
+        let config_path = PathBuf::from(format!("{CONFIG_PATH_BASE}-{port}.conf"));
+        std::fs::write(&config_path, shairport_config(name, port, fifo))
+            .map_err(|e| format!("failed to write shairport config {}: {e}", config_path.display()))?;
+
+        let first = spawn_shairport(&binary, &config_path)?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let child = Arc::new(Mutex::new(Some(first)));
+
+        let monitor = {
+            let stop = Arc::clone(&stop);
+            let child = Arc::clone(&child);
+            let binary = binary.clone();
+            let config_path = config_path.clone();
+            thread::Builder::new()
+                .name("shairport-supervisor".to_string())
+                .spawn(move || monitor_loop(&binary, &config_path, &stop, &child))
+                .map_err(|e| format!("failed to spawn shairport supervisor thread: {e}"))?
+        };
+
+        Ok(Self { stop, child, monitor: Some(monitor) })
+    }
+}
+
+impl Drop for ShairportSupervisor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(mut child) = self.child.lock().expect("shairport child mutex poisoned").take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(monitor) = self.monitor.take() {
+            let _ = monitor.join();
+        }
+    }
+}
+
+/// Wait on the current child, relaunching after a short delay if it exits and we
+/// are not stopping.
+fn monitor_loop(binary: &str, config_path: &Path, stop: &AtomicBool, child: &Mutex<Option<Child>>) {
+    loop {
+        let current = child.lock().expect("shairport child mutex poisoned").take();
+        if let Some(mut current) = current {
+            let _ = current.wait();
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(SHAIRPORT_RESTART_DELAY);
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match spawn_shairport(binary, config_path) {
+            Ok(next) => *child.lock().expect("shairport child mutex poisoned") = Some(next),
+            Err(e) => {
+                eprintln!("shairport-sync relaunch failed: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Spawn one classic `shairport-sync` configured by the file at `config_path`,
+/// selecting the pipe output backend.
+fn spawn_shairport(binary: &str, config_path: &Path) -> Result<Child, String> {
+    Command::new(binary)
+        .arg("-c")
+        .arg(config_path)
+        .arg("-o")
+        .arg("pipe")
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn shairport-sync `{binary}`: {e}"))
 }
 
 #[cfg(test)]
@@ -61,5 +210,20 @@ mod tests {
         let planar = i16le_to_planar_f32(&bytes, 2);
         assert_eq!(planar[0].len(), 1);
         assert_eq!(planar[1].len(), 1);
+    }
+
+    #[test]
+    fn config_sets_name_port_and_pipe() {
+        let cfg = shairport_config("Audio Share (Hub)", 5000, Path::new("/tmp/x.pcm"));
+        assert!(cfg.contains("name = \"Audio Share (Hub)\""), "{cfg}");
+        assert!(cfg.contains("port = 5000"), "{cfg}");
+        assert!(cfg.contains("name = \"/tmp/x.pcm\""), "{cfg}"); // pipe.name
+        assert!(cfg.contains("pipe ="), "{cfg}");
+    }
+
+    #[test]
+    fn fifo_path_is_indexed() {
+        assert_eq!(fifo_path(0), PathBuf::from("/tmp/audioshare-airplay-0.pcm"));
+        assert_eq!(fifo_path(3), PathBuf::from("/tmp/audioshare-airplay-3.pcm"));
     }
 }
