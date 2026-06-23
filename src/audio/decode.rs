@@ -158,7 +158,7 @@ pub fn stream_url_to_output(
 
 /// Holds the resampler (or a passthrough when rates match) plus the per-channel
 /// accumulator that feeds the resampler its required fixed-size chunks.
-struct ResamplePipeline {
+pub(crate) struct ResamplePipeline {
     in_rate: u32,
     in_channels: usize,
     out_channels: usize,
@@ -169,7 +169,7 @@ struct ResamplePipeline {
 }
 
 impl ResamplePipeline {
-    fn new(
+    pub(crate) fn new(
         in_rate: u32,
         in_channels: usize,
         out_rate: u32,
@@ -200,7 +200,7 @@ impl ResamplePipeline {
 
     /// Append a mixed (output-channel, source-rate) planar buffer, then emit as
     /// much resampled, interleaved audio to `output` as is now available.
-    fn push_and_drain(&mut self, mixed: Vec<Vec<f32>>, output: &dyn AudioSink) {
+    pub(crate) fn push_and_drain(&mut self, mixed: Vec<Vec<f32>>, output: &dyn AudioSink) {
         match self.resampler.as_mut() {
             // No resampling needed: interleave and write directly.
             None => output.write(&interleave(&mixed)),
@@ -231,7 +231,7 @@ impl ResamplePipeline {
 /// same frame length. Handles the common internet-radio cases (mono→stereo
 /// duplicate, stereo→mono average, equal pass-through); for other combinations
 /// each output channel maps to source channel `i % in_channels`.
-fn mix_planar(input: &[Vec<f32>], out_channels: usize) -> Vec<Vec<f32>> {
+pub(crate) fn mix_planar(input: &[Vec<f32>], out_channels: usize) -> Vec<Vec<f32>> {
     let in_channels = input.len();
     if in_channels == 0 || out_channels == 0 {
         return vec![Vec::new(); out_channels];
