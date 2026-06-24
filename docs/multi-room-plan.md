@@ -621,6 +621,34 @@ work is last, behind a stable interface.
   connect, plays when its zone is targeted, and a grouped zone stays in sync
   (Snapcast).
 
+#### Bring-up notes (AirPlay Slice 1 — standalone receive path, 2026-06)
+
+Slice 1 proves the AirPlay receive path end-to-end with zero engine/hub-server wiring via an ignored test (`receives_airplay_briefly` in `src/audio/airplay.rs`):
+
+1. **Classic `shairport-sync` is required.** V1 AirPlay (non-AirPlay-2) is the
+   only build shape that supports the per-zone multi-instance approach planned for
+   Slice 2+. Verify your installation is not AirPlay-2: `apt install shairport-sync`
+   defaults to classic on current Debian distributions (check `shairport-sync -h`
+   for a `-c` config option; AirPlay-2 builds add `-A` for AirPlay-2 mode, which
+   will break multi-instance).
+2. **The distro service must be disabled.** Just as with Snapcast, the standard
+   `shairport-sync.service` auto-starts a receiver on the AirPlay name/ports (5000,
+   5353), blocking the hub from registering its own. Disable it with:
+   ```bash
+   sudo systemctl disable --now shairport-sync
+   ```
+3. **Slice 1 demo is standalone.** The ignored test spawns a `ShairportSupervisor`
+   directly and pumps its FIFO to the hub's local cpal `AudioOutput` with zero
+   engine/connection wiring. This is intentional and mirrors how Snapcast sub-step 1
+   proved the path before sub-step 2 wired it into the engine. Run the test with:
+   ```bash
+   cargo test audio::airplay::tests::receives_airplay_briefly -- --ignored --nocapture
+   ```
+   While it runs, open the AirPlay menu on an iPhone/Mac, pick the receiver named
+   "Audio Share (Hub)", and play something — you should hear it from the test machine's
+   default output for ~30s. Per-zone supervision and engine integration (`ShairportManager`)
+   are Slice 2 work.
+
 ---
 
 ## Roadmap mapping (for cross-reference)

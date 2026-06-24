@@ -1,3 +1,4 @@
+pub mod airplay;
 pub mod decode;
 pub mod engine;
 pub mod output;
