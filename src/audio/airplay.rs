@@ -36,6 +36,22 @@ const CONFIG_PATH_BASE: &str = "/tmp/audioshare-shairport";
 /// How long to wait before relaunching a shairport-sync that exited.
 const SHAIRPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
 
+/// Base RTSP port for classic shairport-sync instances; instance `slot` uses
+/// `RTSP_PORT_BASE + slot`. Classic AirPlay needs a distinct port per instance.
+pub const RTSP_PORT_BASE: u16 = 5000;
+
+/// RTSP port for receiver `slot`.
+pub fn slot_port(slot: usize) -> u16 {
+    RTSP_PORT_BASE + slot as u16
+}
+
+/// A stable, unique-per-slot AirPlay device id (12 hex chars, the classic
+/// `airplay_device_id` format). Distinct ids stop AirPlay 1 clients from
+/// conflating instances at the same IP.
+pub fn slot_device_id(slot: usize) -> String {
+    format!("AA5500{:06X}", slot)
+}
+
 /// Path of the audio FIFO backing receiver `index`.
 pub fn fifo_path(index: usize) -> PathBuf {
     PathBuf::from(format!("{FIFO_PATH_BASE}-{index}.pcm"))
@@ -60,9 +76,9 @@ pub(crate) fn i16le_to_planar_f32(bytes: &[u8], channels: usize) -> Vec<Vec<f32>
 
 /// Build a minimal libconfig `shairport-sync` config: a named classic-AirPlay
 /// receiver on `port` whose `pipe` backend writes raw PCM to `fifo_path`.
-fn shairport_config(name: &str, port: u16, fifo_path: &Path) -> String {
+fn shairport_config(name: &str, port: u16, device_id: &str, fifo_path: &Path) -> String {
     format!(
-        "general =\n{{\n  name = \"{name}\";\n  port = {port};\n}};\n\n\
+        "general =\n{{\n  name = \"{name}\";\n  port = {port};\n  airplay_device_id = \"{device_id}\";\n}};\n\n\
          pipe =\n{{\n  name = \"{}\";\n}};\n",
         fifo_path.display()
     )
@@ -95,9 +111,15 @@ pub struct ShairportSupervisor {
 
 impl ShairportSupervisor {
     /// Spawn `shairport-sync` (resolved from `PATH`) as a receiver named `name`
-    /// on `port`, writing PCM to `fifo`.
-    pub fn spawn(name: &str, port: u16, fifo: &Path) -> Result<Self, String> {
-        Self::spawn_with("shairport-sync", name, port, fifo)
+    /// on `port`, writing PCM to `fifo`, with device id `device_id`.
+    pub fn spawn(name: &str, port: u16, device_id: &str, fifo: &Path) -> Result<Self, String> {
+        Self::spawn_with("shairport-sync", name, port, device_id, fifo)
+    }
+
+    /// Production entry: spawn the receiver for `slot`, deriving port, device id,
+    /// and audio FIFO from the slot index.
+    pub fn spawn_for_slot(name: &str, slot: usize) -> Result<Self, String> {
+        Self::spawn(name, slot_port(slot), &slot_device_id(slot), &fifo_path(slot))
     }
 
     /// Like [`spawn`](Self::spawn) but with an explicit binary (for tests/dev).
@@ -105,13 +127,14 @@ impl ShairportSupervisor {
         binary: impl Into<String>,
         name: &str,
         port: u16,
+        device_id: &str,
         fifo: &Path,
     ) -> Result<Self, String> {
         let binary = binary.into();
         ensure_fifo(fifo)?;
 
         let config_path = PathBuf::from(format!("{CONFIG_PATH_BASE}-{port}.conf"));
-        std::fs::write(&config_path, shairport_config(name, port, fifo))
+        std::fs::write(&config_path, shairport_config(name, port, device_id, fifo))
             .map_err(|e| format!("failed to write shairport config {}: {e}", config_path.display()))?;
 
         let first = spawn_shairport(&binary, &config_path)?;
@@ -279,11 +302,30 @@ mod tests {
 
     #[test]
     fn config_sets_name_port_and_pipe() {
-        let cfg = shairport_config("Audio Share (Hub)", 5000, Path::new("/tmp/x.pcm"));
+        let cfg = shairport_config("Audio Share (Hub)", 5000, "AA5500000000", Path::new("/tmp/x.pcm"));
         assert!(cfg.contains("name = \"Audio Share (Hub)\""), "{cfg}");
         assert!(cfg.contains("port = 5000"), "{cfg}");
         assert!(cfg.contains("name = \"/tmp/x.pcm\""), "{cfg}"); // pipe.name
         assert!(cfg.contains("pipe ="), "{cfg}");
+    }
+
+    #[test]
+    fn slot_maps_to_unique_port_and_device_id() {
+        assert_eq!(slot_port(0), 5000);
+        assert_eq!(slot_port(3), 5003);
+        // Device ids are stable and distinct per slot.
+        assert_ne!(slot_device_id(0), slot_device_id(1));
+        assert_eq!(slot_device_id(0), slot_device_id(0));
+        assert_eq!(slot_device_id(0).len(), 12);
+    }
+
+    #[test]
+    fn config_includes_device_id() {
+        let cfg = shairport_config("Kitchen", 5002, "AA5500000002", Path::new("/tmp/x.pcm"));
+        assert!(cfg.contains("name = \"Kitchen\""), "{cfg}");
+        assert!(cfg.contains("port = 5002"), "{cfg}");
+        assert!(cfg.contains("airplay_device_id = \"AA5500000002\""), "{cfg}");
+        assert!(cfg.contains("name = \"/tmp/x.pcm\""), "{cfg}"); // pipe.name
     }
 
     #[test]
@@ -367,8 +409,7 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
 
-        let fifo = fifo_path(0);
-        let _server = ShairportSupervisor::spawn("Audio Share (Hub)", 5000, &fifo)
+        let _server = ShairportSupervisor::spawn_for_slot("Audio Share (Hub)", 0)
             .expect("shairport-sync should spawn (is the classic build installed?)");
 
         let output = Arc::new(AudioOutput::new().expect("open default output device"));
@@ -376,7 +417,7 @@ mod tests {
 
         let pump_output = Arc::clone(&output);
         let pump_stop = Arc::clone(&stop);
-        let pump_fifo = fifo.clone();
+        let pump_fifo = fifo_path(0);
         let worker = thread::spawn(move || {
             pump_fifo_to_sink(&pump_fifo, pump_output.as_ref(), &pump_stop)
         });
