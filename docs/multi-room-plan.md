@@ -621,6 +621,26 @@ work is last, behind a stable interface.
   connect, plays when its zone is targeted, and a grouped zone stays in sync
   (Snapcast).
 
+#### Bring-up notes (AirPlay Slice 2 — per-zone receivers wired into the engine, 2026-06)
+
+**AirPlay service conflict:** `apt install shairport-sync` enables a systemd
+`shairport-sync.service` that auto-starts an instance grabbing an AirPlay name +
+ports (5000, 5353) — the direct analog of the `snapserver.service` collision.
+Disable it before starting the hub so the hub owns its supervised per-zone
+instances:
+
+```bash
+sudo systemctl disable --now shairport-sync
+```
+
+The **classic (not AirPlay-2) build** is required. Multiple classic instances on
+one host (distinct device id + RTSP port each) are well supported; AirPlay 2
+clients are confused by several AP2 players at the same IP (NQPTP only serves
+one instance). Verify: `shairport-sync -h` — AirPlay-2 builds add a `-A` flag;
+standard Debian packages default to classic.
+
+---
+
 #### Bring-up notes (AirPlay Slice 1 — standalone receive path, 2026-06)
 
 Slice 1 proves the AirPlay receive path end-to-end with zero engine/hub-server wiring via an ignored test (`receives_airplay_briefly` in `src/audio/airplay.rs`):

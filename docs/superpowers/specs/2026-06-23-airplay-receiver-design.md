@@ -277,7 +277,7 @@ Each slice ends at something demoable; the most-additive UX lands last.
   wired into the engine. *Demo:* iPhone picks "Hub" in AirPlay, sound comes out
   the hub speaker. (Mirrors Change 5 sub-step 1 proving the path before custom
   code.)
-- **Slice 2 — Per-zone receivers + default source→zone routing.**
+- **Slice 2 — Per-zone receivers + default source→zone routing. [DONE]**
   `ShairportManager` reconciled against the zone set (one receiver per zone, incl.
   dongle auto-zones); session begin/end via the metadata pipe (`pbeg`/`pend`
   only); each source feeds its home zone through `zone_sink()` — so dongle zones
@@ -285,6 +285,16 @@ Each slice ends at something demoable; the most-additive UX lands last.
   handling. Adds the `sources` push (active/`dest_zone`, no track info yet),
   `SOURCES_CHANGED`, `list_sources`. *Demo:* AirPlay to "Kitchen" → sound at the
   Kitchen dongle; the app shows Kitchen is receiving.
+
+  > **As built — session-bracket deviation:** sessions are bracketed by the
+  > **audio FIFO** (FIFO open = session began, EOF = session ended), not the
+  > metadata pipe (`pbeg`/`pend`). The metadata pipe is introduced in Slice 3
+  > (track info). Using the audio FIFO avoids interrupting a blocked PCM reader
+  > and makes routing per-chunk (reroute-ready): each chunk resolves the current
+  > sink through `sink_for_source()` so a reroute takes effect on the very next
+  > write with no reader restart. This is a deliberate design choice, not a
+  > shortcut, and it supersedes the metadata-pipe bracket described in the spec
+  > body above for session lifetime purposes.
 - **Slice 3 — Track metadata + album art.** Full metadata-pipe parse
   (title/artist/album, `PICT`), art cache keyed by hash, `get_art` task, `art_id`
   in the push. *Demo:* the app shows now-playing title/artist/album + art.
