@@ -15,6 +15,9 @@ pub enum Task {
     /// Client asks the hub to (re-)send the current speaker/zone list. Handled in
     /// `Connection::handle_task` (it needs the connection to push), not `dispatch`.
     ListOutputs,
+    /// Client asks the hub to (re-)send the current AirPlay source list. Handled in
+    /// `Connection::handle_task` (it needs the connection to push), not `dispatch`.
+    ListSources,
     CreateZone,
     DeleteZone,
     RenameZone,
@@ -31,6 +34,7 @@ impl Task {
             "seek" => Task::Seek,
             "volume" => Task::Volume,
             "list_outputs" => Task::ListOutputs,
+            "list_sources" => Task::ListSources,
             "create_zone" => Task::CreateZone,
             "delete_zone" => Task::DeleteZone,
             "rename_zone" => Task::RenameZone,
@@ -48,6 +52,7 @@ impl Task {
             Task::Seek => "seek",
             Task::Volume => "volume",
             Task::ListOutputs => "list_outputs",
+            Task::ListSources => "list_sources",
             Task::CreateZone => "create_zone",
             Task::DeleteZone => "delete_zone",
             Task::RenameZone => "rename_zone",
@@ -155,6 +160,11 @@ pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
 mod tests {
     use super::*;
     use crate::json_structs::json_trait::JsonSerializable;
+
+    #[test]
+    fn parses_list_sources_task() {
+        assert_eq!(Task::parse("list_sources"), Task::ListSources);
+    }
 
     #[test]
     fn parses_known_and_unknown_tasks() {
