@@ -208,28 +208,20 @@ fn spawn_shairport(binary: &str, config_path: &Path) -> Result<Child, String> {
         .map_err(|e| format!("failed to spawn shairport-sync `{binary}`: {e}"))
 }
 
-/// Read one AirPlay session from `fifo` into `sink`: open the FIFO (blocking
-/// until shairport-sync opens the write end on session start), then read until
-/// EOF (session end) or `stop`. Returns `Ok(())` on a clean EOF.
-fn pump_one_session(
-    fifo: &Path,
-    sink: &dyn AudioSink,
+/// Pump one already-open AirPlay FIFO `file` to EOF. Per chunk, `resolve()`
+/// returns the sink to write into right now (or `None` to discard — the source
+/// is connected-but-unrouted). The resample pipeline is (re)built whenever the
+/// resolved sink's format changes. Returns `Ok(())` on a clean EOF (session end).
+fn pump_open(
+    mut file: File,
     stop: &Arc<AtomicBool>,
+    resolve: &mut impl FnMut() -> Option<Arc<dyn AudioSink>>,
 ) -> Result<(), String> {
-    // Blocking open: returns once a writer (shairport) is present.
-    let mut file = File::open(fifo)
-        .map_err(|e| format!("open airplay fifo {} failed: {e}", fifo.display()))?;
-
-    let mut pipeline = ResamplePipeline::new(
-        AIRPLAY_SAMPLE_RATE,
-        AIRPLAY_CHANNELS,
-        sink.sample_rate(),
-        sink.channels() as usize,
-    )?;
-
     let frame_bytes = AIRPLAY_CHANNELS * 2;
     let mut remainder: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
+    // Lazily built per (sample_rate, channels) of the currently resolved sink.
+    let mut pipeline: Option<(u32, u16, ResamplePipeline)> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -247,26 +239,75 @@ fn pump_one_session(
         if whole == 0 {
             continue;
         }
+
+        // Where do we write this chunk right now?
+        let Some(sink) = resolve() else {
+            remainder.drain(..whole); // unrouted: discard, stay session-active
+            continue;
+        };
+
+        // (Re)build the pipeline if the sink's format changed.
+        let need_rebuild = !matches!(
+            &pipeline,
+            Some((sr, ch, _)) if *sr == sink.sample_rate() && *ch == sink.channels()
+        );
+        if need_rebuild {
+            let p = ResamplePipeline::new(
+                AIRPLAY_SAMPLE_RATE,
+                AIRPLAY_CHANNELS,
+                sink.sample_rate(),
+                sink.channels() as usize,
+            )?;
+            pipeline = Some((sink.sample_rate(), sink.channels(), p));
+        }
+
         let planar = i16le_to_planar_f32(&remainder[..whole], AIRPLAY_CHANNELS);
         remainder.drain(..whole);
-
         let mixed = mix_planar(&planar, sink.channels() as usize);
-        pipeline.push_and_drain(mixed, sink);
+        if let Some((_, _, p)) = pipeline.as_mut() {
+            p.push_and_drain(mixed, sink.as_ref());
+        }
     }
 }
 
-/// Continuously receive AirPlay audio from `fifo` into `sink` until `stop` is
-/// set: each session is one [`pump_one_session`] cycle; between sessions the
-/// blocking FIFO open parks the thread until the next sender connects.
-pub fn pump_fifo_to_sink(
+/// Continuously receive AirPlay sessions from `fifo` until `stop`. Each blocking
+/// FIFO open is a session start (`began`); EOF is its end (`ended`). While a
+/// session runs, `resolve` decides per chunk where the audio goes (live routing,
+/// including unrouted = discard). Mirrors the URL decode loop but pull-driven by
+/// the sender.
+pub fn run_receiver(
     fifo: &Path,
-    sink: &dyn AudioSink,
     stop: &Arc<AtomicBool>,
+    mut began: impl FnMut(),
+    mut resolve: impl FnMut() -> Option<Arc<dyn AudioSink>>,
+    mut ended: impl FnMut(),
 ) -> Result<(), String> {
     while !stop.load(Ordering::Relaxed) {
-        pump_one_session(fifo, sink, stop)?;
+        // Blocking open: returns once a sender (shairport) opens the write end.
+        let file = match File::open(fifo) {
+            Ok(f) => f,
+            Err(e) => return Err(format!("open airplay fifo {} failed: {e}", fifo.display())),
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        began();
+        let result = pump_open(file, stop, &mut resolve);
+        ended();
+        result?;
     }
     Ok(())
+}
+
+/// Convenience wrapper (used by the Slice 1 demo test): pump `fifo` into a single
+/// fixed `sink` across sessions until `stop`.
+pub fn pump_fifo_to_sink(
+    fifo: &Path,
+    sink: &Arc<dyn AudioSink>,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let sink = Arc::clone(sink);
+    run_receiver(fifo, stop, || {}, move || Some(Arc::clone(&sink)), || {})
 }
 
 #[cfg(test)]
@@ -335,65 +376,102 @@ mod tests {
     }
 
     #[test]
-    fn pump_passes_through_at_native_rate() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
+    fn run_receiver_brackets_session_and_routes_chunks() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
 
-        // A sink at AirPlay's native rate/channels: no resampling, exact passthrough.
         struct Capture(std::sync::Mutex<Vec<f32>>);
         impl AudioSink for Capture {
             fn sample_rate(&self) -> u32 { AIRPLAY_SAMPLE_RATE }
             fn channels(&self) -> u16 { AIRPLAY_CHANNELS as u16 }
-            fn write(&self, samples: &[f32]) {
-                self.0.lock().unwrap().extend_from_slice(samples);
-            }
+            fn write(&self, samples: &[f32]) { self.0.lock().unwrap().extend_from_slice(samples); }
         }
 
-        let path = std::env::temp_dir().join(format!("as-airplay-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("as-airplay-run-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let c_path = CString::new(path.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo failed");
 
-        // Known interleaved stereo samples -> s16le bytes.
-        let samples: Vec<f32> = vec![0.0, 0.5, -0.5, 0.25, 1.0, -1.0];
+        let samples: Vec<f32> = vec![0.0, 0.5, -0.5, 0.25];
         let mut bytes = Vec::new();
         for &s in &samples {
             let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
             bytes.extend_from_slice(&v.to_le_bytes());
         }
 
-        // Writer thread: open the FIFO for writing (blocks until the reader opens
-        // the read end), write all bytes, then close to signal EOF.
         let writer_path = path.clone();
         let writer = std::thread::spawn(move || {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new().write(true).open(&writer_path).unwrap();
             f.write_all(&bytes).unwrap();
-            // Dropping `f` closes the write end -> reader sees EOF.
+            // drop -> EOF -> session end
         });
 
         let sink = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
         let stop = Arc::new(AtomicBool::new(false));
+        let begins = Arc::new(AtomicUsize::new(0));
+        let ends = Arc::new(AtomicUsize::new(0));
 
-        // Reader thread: pump until the first session ends, then stop.
-        let reader_sink = Arc::clone(&sink);
-        let reader_stop = Arc::clone(&stop);
         let reader_path = path.clone();
+        let reader_stop = Arc::clone(&stop);
+        let reader_sink = Arc::clone(&sink);
+        let reader_begins = Arc::clone(&begins);
+        let reader_ends = Arc::clone(&ends);
         let reader = std::thread::spawn(move || {
-            // Stop after the first EOF so the test terminates: a tiny wrapper that
-            // pumps one session. We set stop right after the writer finishes.
-            let _ = pump_one_session(&reader_path, reader_sink.as_ref(), &reader_stop);
+            // Stop after the first session so the loop terminates.
+            let one_shot = Arc::clone(&reader_stop);
+            let _ = run_receiver(
+                &reader_path,
+                &reader_stop,
+                || { reader_begins.fetch_add(1, O::Relaxed); },
+                || Some(reader_sink.clone() as Arc<dyn AudioSink>),
+                || { reader_ends.fetch_add(1, O::Relaxed); one_shot.store(true, O::Relaxed); },
+            );
         });
 
         writer.join().unwrap();
         reader.join().unwrap();
 
+        assert_eq!(begins.load(O::Relaxed), 1, "began fired once");
+        assert_eq!(ends.load(O::Relaxed), 1, "ended fired once");
         let got = sink.0.lock().unwrap().clone();
-        let _ = std::fs::remove_file(&path);
         assert_eq!(got.len(), samples.len(), "all frames delivered");
         for (g, s) in got.iter().zip(samples.iter()) {
-            assert!((g - s).abs() < 1e-3, "passthrough sample mismatch: {g} vs {s}");
+            assert!((g - s).abs() < 1e-3, "passthrough mismatch: {g} vs {s}");
         }
+    }
+
+    #[test]
+    fn run_receiver_discards_when_unrouted() {
+        let path = std::env::temp_dir().join(format!("as-airplay-discard-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo failed");
+
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&writer_path).unwrap();
+            f.write_all(&[0u8; 64]).unwrap();
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_path = path.clone();
+        let reader_stop = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            let one_shot = Arc::clone(&reader_stop);
+            // resolve always None: every chunk is discarded, must not panic, must EOF cleanly.
+            let _ = run_receiver(
+                &reader_path,
+                &reader_stop,
+                || {},
+                || None,
+                || { one_shot.store(true, std::sync::atomic::Ordering::Relaxed); },
+            );
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     // Live end-to-end check (opt-in: needs the classic `shairport-sync` binary and
@@ -415,11 +493,11 @@ mod tests {
         let output = Arc::new(AudioOutput::new().expect("open default output device"));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let pump_output = Arc::clone(&output);
+        let sink: Arc<dyn AudioSink> = output.clone();
         let pump_stop = Arc::clone(&stop);
         let pump_fifo = fifo_path(0);
         let worker = thread::spawn(move || {
-            pump_fifo_to_sink(&pump_fifo, pump_output.as_ref(), &pump_stop)
+            pump_fifo_to_sink(&pump_fifo, &sink, &pump_stop)
         });
 
         thread::sleep(Duration::from_secs(30));
