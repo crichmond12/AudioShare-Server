@@ -55,6 +55,24 @@ lazy_static! {
     pub static ref SOURCES_CHANGED: broadcast::Sender<()> = broadcast::channel(16).0;
 }
 
+/// The slice of the engine an AirPlay pump thread needs: bracket a session and
+/// ask, per chunk, where the source's audio goes right now. A trait so the
+/// production receiver factory can be wired without a hard dependency cycle and
+/// the engine's session logic stays unit-testable in isolation.
+pub trait SessionSink: Send + Sync {
+    fn session_began(&self, source: &str);
+    fn sink_for_source(&self, source: &str) -> Option<Arc<dyn AudioSink>>;
+    fn session_ended(&self, source: &str);
+}
+
+impl SessionSink for &'static Engine {
+    fn session_began(&self, source: &str) { Engine::session_began(self, source); }
+    fn sink_for_source(&self, source: &str) -> Option<Arc<dyn AudioSink>> {
+        Engine::sink_for_source(self, source)
+    }
+    fn session_ended(&self, source: &str) { Engine::session_ended(self, source); }
+}
+
 /// Name of a zone (a group of outputs sharing playback).
 pub type ZoneId = String;
 
