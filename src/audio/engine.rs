@@ -25,6 +25,7 @@ use std::thread::{self, JoinHandle};
 use lazy_static::lazy_static;
 use tokio::sync::broadcast;
 
+use crate::audio::airplay_manager::{ReceiverFactory, ShairportManager};
 use crate::audio::decode;
 use crate::audio::output::AudioOutput;
 use crate::audio::registry::{Output, OutputId, OutputRegistry};
@@ -152,6 +153,12 @@ pub struct Engine {
     /// Logical AirPlay sources keyed by source id (== home-zone id). Tracks
     /// session/routing state; an independent mutex from `zones`.
     sources: Mutex<HashMap<ZoneId, SourceState>>,
+    /// Optional AirPlay receiver manager. `None` until `enable_airplay` is
+    /// called. When present, reconciled against the zone set on every topology
+    /// change (create/delete/rename zone, add dongle output). Held behind an
+    /// `Arc` so `reconcile_airplay` can clone the handle and release the lock
+    /// before calling `reconcile` (which may spawn a process in production).
+    airplay: Mutex<Option<Arc<ShairportManager>>>,
 }
 
 impl Engine {
@@ -172,6 +179,7 @@ impl Engine {
             zones: Mutex::new(zones),
             snapcast: SnapcastRouter::new(),
             sources: Mutex::new(HashMap::new()),
+            airplay: Mutex::new(None),
         }
     }
 
@@ -359,6 +367,8 @@ impl Engine {
             outputs: vec![id.to_string()],
             current: None,
         });
+        drop(zones); // release before reconcile_airplay, which re-locks zones
+        self.reconcile_airplay();
     }
 
     /// Mark a dongle's output unreachable when it disconnects. The output stays
@@ -378,6 +388,7 @@ impl Engine {
             ZonePlayback { name: name.to_string(), outputs: Vec::new(), current: None },
         );
         self.notify_outputs_changed();
+        self.reconcile_airplay();
         id
     }
 
@@ -391,6 +402,7 @@ impl Engine {
         }
         self.snapcast.release_zone(zone);
         self.notify_outputs_changed();
+        self.reconcile_airplay();
         Ok(())
     }
 
@@ -401,6 +413,7 @@ impl Engine {
         z.name = name.to_string();
         drop(zones);
         self.notify_outputs_changed();
+        self.reconcile_airplay();
         Ok(())
     }
 
@@ -575,10 +588,69 @@ impl Engine {
     fn notify_sources_changed(&self) {
         let _ = SOURCES_CHANGED.send(());
     }
+
+    /// Turn on AirPlay receiving: install the receiver manager and reconcile it
+    /// (and the logical source registry) against the current zone set, spawning a
+    /// receiver per zone. Idempotent-ish: a second call replaces the manager.
+    pub fn enable_airplay(&self, factory: Box<dyn ReceiverFactory>) {
+        *self.airplay.lock().expect("engine airplay mutex poisoned") =
+            Some(Arc::new(ShairportManager::new(factory)));
+        self.reconcile_airplay();
+    }
+
+    /// Converge the logical source registry and (if AirPlay is enabled) the
+    /// receiver manager to the current zone set. Called after any zone-topology
+    /// change.
+    ///
+    /// Lock discipline: snapshots `desired` under `zones` then releases it before
+    /// locking `sources` or calling `mgr.reconcile` (which may spawn a process in
+    /// production). Callers must NOT hold `zones` or `sources` when calling this.
+    fn reconcile_airplay(&self) {
+        // Desired = every zone (id, name). Snapshot under zones lock, then release.
+        let desired: Vec<(String, String)> = {
+            let zones = self.zones.lock().expect("engine zones mutex poisoned");
+            zones.iter().map(|(id, z)| (id.clone(), z.name.clone())).collect()
+        };
+
+        // Keep the logical source registry in step: an idle source per zone; drop
+        // sources whose zone is gone. Preserve session state for surviving zones.
+        {
+            let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+            let desired_ids: std::collections::HashSet<&str> =
+                desired.iter().map(|(id, _)| id.as_str()).collect();
+            sources.retain(|id, _| desired_ids.contains(id.as_str()));
+            for (id, name) in &desired {
+                sources
+                    .entry(id.clone())
+                    .and_modify(|s| s.name = name.clone())
+                    .or_insert_with(|| SourceState {
+                        name: name.clone(),
+                        dest_zone: id.clone(),
+                        active: false,
+                        routed: false,
+                        sink: None,
+                    });
+            }
+        }
+
+        // Snapshot the manager handle, release the airplay lock, THEN reconcile
+        // outside the zones, sources, and airplay locks (reconcile may spawn a
+        // shairport-sync process in production, so we must not hold any engine
+        // lock across it). The guard is a temporary that drops at the `;`.
+        let mgr = self.airplay.lock().expect("engine airplay mutex poisoned").clone();
+        if let Some(mgr) = mgr {
+            mgr.reconcile(&desired);
+        }
+    }
 }
 
 #[cfg(test)]
 impl Engine {
+    /// True if `id` has an entry in the sources map (regardless of active state).
+    fn has_source(&self, id: &str) -> bool {
+        self.sources.lock().unwrap().contains_key(id)
+    }
+
     /// Register an idle source (the device-free half of what reconcile installs).
     fn add_idle_source(&self, id: &str, name: &str) {
         self.sources.lock().unwrap().insert(
@@ -942,6 +1014,44 @@ mod tests {
         let engine = Engine::new();
         engine.session_began("ghost");
         assert!(engine.list_sources().is_empty());
+    }
+
+    #[test]
+    fn enabling_airplay_reconciles_existing_and_new_zones() {
+        use crate::audio::airplay_manager::{ReceiverFactory, ZoneReceiver};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Spy { created: Mutex<Vec<String>> }
+        struct Recv;
+        impl ZoneReceiver for Recv { fn rename(&self, _n: &str) -> Result<(), String> { Ok(()) } }
+        struct SpyFactory { spy: Arc<Spy> }
+        impl ReceiverFactory for SpyFactory {
+            fn create(&self, zone: &str, _name: &str, _slot: usize) -> Result<Box<dyn ZoneReceiver>, String> {
+                self.spy.created.lock().unwrap().push(zone.to_string());
+                Ok(Box::new(Recv))
+            }
+        }
+
+        let engine = Engine::new();
+        let spy = Arc::new(Spy::default());
+        engine.enable_airplay(Box::new(SpyFactory { spy: Arc::clone(&spy) }));
+
+        // Enabling spawns a receiver for the pre-existing default zone, and registers
+        // an idle source for it.
+        {
+            let created = spy.created.lock().unwrap();
+            assert!(created.contains(&"default".to_string()), "default zone got a receiver");
+        }
+        assert!(engine.has_source("default")); // test helper from Task 3 area
+
+        // A new dongle zone reconciles a new receiver + idle source.
+        engine.add_dongle_output("d1", "Kitchen");
+        {
+            let created = spy.created.lock().unwrap();
+            assert!(created.contains(&"d1".to_string()), "dongle zone got a receiver");
+        }
+        assert!(engine.has_source("d1"));
     }
 
     // FanOut forwards writes to every member sink.
