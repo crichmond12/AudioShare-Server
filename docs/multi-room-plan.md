@@ -639,6 +639,34 @@ clients are confused by several AP2 players at the same IP (NQPTP only serves
 one instance). Verify: `shairport-sync -h` — AirPlay-2 builds add a `-A` flag;
 standard Debian packages default to classic.
 
+**Harmless D-Bus / MPRIS warnings.** The stock `shairport-sync` is built with the
+D-Bus + MPRIS interfaces, so each supervised instance tries to own these names on
+the **system** bus at startup:
+
+```
+warning: could not acquire a Shairport Sync native D-Bus interface "org.gnome.ShairportSync.i<pid>" on the system bus.
+warning: could not acquire an MPRIS interface named "org.mpris.MediaPlayer2.ShairportSync.i<pid>" on the system bus.
+```
+
+The package's own policies (`/usr/share/dbus-1/system.d/shairport-sync-*-policy.conf`)
+grant ownership only to users `root` and `shairport-sync`, but the hub runs
+shairport-sync as the user running `audioshare_device` (e.g. `crichmond`). These
+interfaces are shairport's remote-control / metadata-over-D-Bus feature, which
+Audio Share does not use (audio rides the `-o pipe` FIFO; Slice 3 track metadata
+uses shairport's metadata pipe). **The warnings are cosmetic — AirPlay receive
+works regardless.** To silence them, install the bundled policy that lets the hub
+user own the (per-instance-suffixed, hence `own_prefix`) names. Edit the `user=`
+in the file to match the account that runs the hub:
+
+```bash
+sudo install -m 0644 deploy/audioshare-shairport-dbus.conf \
+    /etc/dbus-1/system.d/audioshare-shairport-dbus.conf
+sudo systemctl reload dbus
+```
+
+There is no runtime switch to disable the interfaces (they are compiled in), so
+the policy file is the clean route.
+
 ---
 
 #### Bring-up notes (AirPlay Slice 1 — standalone receive path, 2026-06)
