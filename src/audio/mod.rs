@@ -1,4 +1,6 @@
 pub mod airplay;
+pub mod airplay_factory;
+pub mod airplay_manager;
 pub mod decode;
 pub mod engine;
 pub mod output;

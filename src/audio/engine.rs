@@ -25,6 +25,7 @@ use std::thread::{self, JoinHandle};
 use lazy_static::lazy_static;
 use tokio::sync::broadcast;
 
+use crate::audio::airplay_manager::{ReceiverFactory, ShairportManager};
 use crate::audio::decode;
 use crate::audio::output::AudioOutput;
 use crate::audio::registry::{Output, OutputId, OutputRegistry};
@@ -49,6 +50,28 @@ lazy_static! {
     /// missed/lagged tick is harmless. The registry stays observer-free (per its
     /// own doc); the engine owns this eventing.
     pub static ref OUTPUTS_CHANGED: broadcast::Sender<()> = broadcast::channel(16).0;
+
+    /// Broadcast tick fired whenever the set/state of active AirPlay sources changes
+    /// (session begin/end, route/detach). Per-client connections re-push `sources`.
+    pub static ref SOURCES_CHANGED: broadcast::Sender<()> = broadcast::channel(16).0;
+}
+
+/// The slice of the engine an AirPlay pump thread needs: bracket a session and
+/// ask, per chunk, where the source's audio goes right now. A trait so the
+/// production receiver factory can be wired without a hard dependency cycle and
+/// the engine's session logic stays unit-testable in isolation.
+pub trait SessionSink: Send + Sync {
+    fn session_began(&self, source: &str);
+    fn sink_for_source(&self, source: &str) -> Option<Arc<dyn AudioSink>>;
+    fn session_ended(&self, source: &str);
+}
+
+impl SessionSink for &'static Engine {
+    fn session_began(&self, source: &str) { Engine::session_began(self, source); }
+    fn sink_for_source(&self, source: &str) -> Option<Arc<dyn AudioSink>> {
+        Engine::sink_for_source(self, source)
+    }
+    fn session_ended(&self, source: &str) { Engine::session_ended(self, source); }
 }
 
 /// Name of a zone (a group of outputs sharing playback).
@@ -68,11 +91,45 @@ impl Pipeline {
     }
 }
 
+/// What currently drives a zone's audio. One driver per zone, last-wins.
+enum ZoneDriver {
+    /// A URL decode pipeline (internet radio etc.).
+    Url(Pipeline),
+    /// An AirPlay source (by its id == home-zone id) is feeding this zone.
+    Airplay(ZoneId),
+}
+
+/// Logical state of one AirPlay receiver/source. The OS process + pump thread
+/// live in the ShairportManager; this is the routing/session view the engine and
+/// the `sources` push need.
+struct SourceState {
+    name: String,
+    dest_zone: ZoneId, // Slice 2: always == the source id (reroute is Slice 4)
+    active: bool,      // a session is in progress (FIFO open)
+    routed: bool,      // currently dest_zone's driver (false = connected-but-unrouted)
+    sink: Option<Arc<dyn AudioSink>>, // cached resolved sink while active+routed
+}
+
+/// A source as reported to clients (active sessions only).
+pub struct SourceView {
+    pub source: ZoneId,
+    pub name: String,
+    pub dest_zone: ZoneId,
+    pub routed: bool,
+}
+
+impl SourceView {
+    #[cfg(test)]
+    fn active_but_unrouted(&self) -> bool {
+        !self.routed
+    }
+}
+
 /// A zone's membership plus its current in-flight playback (if any).
 struct ZonePlayback {
     name: String,
     outputs: Vec<OutputId>,
-    current: Option<Pipeline>,
+    current: Option<ZoneDriver>,
 }
 
 /// A zone as reported to clients: id, label, member output ids, and whether it
@@ -93,6 +150,15 @@ pub struct Engine {
     /// zone play (inside `sink_for_zone`). Dongle outputs carry `sink: None`
     /// in the registry — the router allocates a per-zone FIFO sink at play time.
     snapcast: SnapcastRouter,
+    /// Logical AirPlay sources keyed by source id (== home-zone id). Tracks
+    /// session/routing state; an independent mutex from `zones`.
+    sources: Mutex<HashMap<ZoneId, SourceState>>,
+    /// Optional AirPlay receiver manager. `None` until `enable_airplay` is
+    /// called. When present, reconciled against the zone set on every topology
+    /// change (create/delete/rename zone, add dongle output). Held behind an
+    /// `Arc` so `reconcile_airplay` can clone the handle and release the lock
+    /// before calling `reconcile` (which may spawn a process in production).
+    airplay: Mutex<Option<Arc<ShairportManager>>>,
 }
 
 impl Engine {
@@ -112,6 +178,8 @@ impl Engine {
             registry: Arc::new(OutputRegistry::new()),
             zones: Mutex::new(zones),
             snapcast: SnapcastRouter::new(),
+            sources: Mutex::new(HashMap::new()),
+            airplay: Mutex::new(None),
         }
     }
 
@@ -187,11 +255,21 @@ impl Engine {
         // removed while the lock was released, and a concurrent play on the same
         // zone may have installed a pipeline — taking+shutting the existing one
         // before installing ours guarantees at most one active decoder per zone.
+        // Take any existing driver under the lock, then release the lock before
+        // detaching it: detach_driver may join a decode thread (URL) or lock
+        // `sources` (Airplay), and must never run while holding `zones`.
+        let prev = {
+            let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+            // Ensure the zone still exists before we tear down anything.
+            zones.get(zone).ok_or_else(|| "unknown_zone".to_string())?;
+            zones.get_mut(zone).and_then(|z| z.current.take())
+        };
+        if let Some(prev) = prev {
+            self.detach_driver(prev);
+        }
+
         let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
         let zone_state = zones.get_mut(zone).ok_or_else(|| "unknown_zone".to_string())?;
-        if let Some(pipeline) = zone_state.current.take() {
-            pipeline.shutdown();
-        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -206,19 +284,19 @@ impl Engine {
             })
             .map_err(|e| format!("failed to spawn decode thread: {e}"))?;
 
-        zone_state.current = Some(Pipeline { stop, handle });
+        zone_state.current = Some(ZoneDriver::Url(Pipeline { stop, handle }));
         Ok(())
     }
 
     /// Stop `zone`'s current playback. No-op if the zone is unknown or idle.
     pub fn stop(&self, zone: &str) {
-        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
-        if let Some(zone_state) = zones.get_mut(zone) {
-            if let Some(pipeline) = zone_state.current.take() {
-                pipeline.shutdown();
-            }
+        let prev = {
+            let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+            zones.get_mut(zone).and_then(|z| z.current.take())
+        };
+        if let Some(prev) = prev {
+            self.detach_driver(prev);
         }
-        drop(zones);
         self.snapcast.release_zone(zone);
     }
 
@@ -289,6 +367,8 @@ impl Engine {
             outputs: vec![id.to_string()],
             current: None,
         });
+        drop(zones); // release before reconcile_airplay, which re-locks zones
+        self.reconcile_airplay();
     }
 
     /// Mark a dongle's output unreachable when it disconnects. The output stays
@@ -308,6 +388,7 @@ impl Engine {
             ZonePlayback { name: name.to_string(), outputs: Vec::new(), current: None },
         );
         self.notify_outputs_changed();
+        self.reconcile_airplay();
         id
     }
 
@@ -316,11 +397,12 @@ impl Engine {
         let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
         let removed = zones.remove(zone).ok_or_else(|| "unknown_zone".to_string())?;
         drop(zones);
-        if let Some(pipeline) = removed.current {
-            pipeline.shutdown();
+        if let Some(driver) = removed.current {
+            self.detach_driver(driver);
         }
         self.snapcast.release_zone(zone);
         self.notify_outputs_changed();
+        self.reconcile_airplay();
         Ok(())
     }
 
@@ -331,6 +413,7 @@ impl Engine {
         z.name = name.to_string();
         drop(zones);
         self.notify_outputs_changed();
+        self.reconcile_airplay();
         Ok(())
     }
 
@@ -374,6 +457,230 @@ impl Engine {
     /// Re-run Snapcast reconcile (fired by snapserver client-connect events).
     pub fn snapcast_on_notify(&self) {
         self.snapcast.reconcile_now();
+    }
+
+    /// Tear down a zone's previous driver. A URL pipeline is shut down; an AirPlay
+    /// source is marked unrouted (its pump keeps reading but discards until the
+    /// session ends or it is rerouted). Never holds the zones lock when called.
+    fn detach_driver(&self, driver: ZoneDriver) {
+        match driver {
+            ZoneDriver::Url(pipeline) => pipeline.shutdown(),
+            ZoneDriver::Airplay(source) => {
+                let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+                if let Some(s) = sources.get_mut(&source) {
+                    s.routed = false;
+                    s.sink = None;
+                }
+            }
+        }
+    }
+
+    /// An AirPlay session started on `source` (its FIFO opened). Make it the driver
+    /// of its dest_zone, last-wins over any URL/other source there. No sink is
+    /// resolved here — `sink_for_source` resolves lazily on the first chunk so an
+    /// idle receiver never holds a snapserver slot / open device.
+    pub fn session_began(&self, source: &str) {
+        let dest = {
+            let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+            let Some(s) = sources.get_mut(source) else { return };
+            s.active = true;
+            s.routed = true;
+            s.sink = None;
+            s.dest_zone.clone()
+        };
+
+        // Detach whatever drives dest now, then install this source. Snapshot+release
+        // around any blocking shutdown.
+        let prev = {
+            let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+            if let Some(z) = zones.get_mut(&dest) {
+                let prev = z.current.take();
+                z.current = Some(ZoneDriver::Airplay(source.to_string()));
+                prev
+            } else {
+                None
+            }
+        };
+        if let Some(prev) = prev {
+            self.detach_driver(prev);
+        }
+
+        self.notify_sources_changed();
+        self.notify_outputs_changed(); // zone "playing" state changed
+    }
+
+    /// Where should `source` write right now? `None` if it has no active session or
+    /// has been detached (unrouted). Resolves and caches the dest_zone's sink on the
+    /// first call of a session (lock released around the blocking `zone_sink`).
+    pub fn sink_for_source(&self, source: &str) -> Option<Arc<dyn AudioSink>> {
+        // Fast path: cached, or clearly not routed.
+        let (dest, outputs) = {
+            let sources = self.sources.lock().expect("engine sources mutex poisoned");
+            let s = sources.get(source)?;
+            if !s.active || !s.routed {
+                return None;
+            }
+            if let Some(sink) = &s.sink {
+                return Some(Arc::clone(sink));
+            }
+            let dest = s.dest_zone.clone();
+            let outputs = {
+                let zones = self.zones.lock().expect("engine zones mutex poisoned");
+                zones.get(&dest).map(|z| z.outputs.clone())?
+            };
+            (dest, outputs)
+        };
+
+        // Resolve off the locks (zone_sink can spawn snapserver / open cpal).
+        let sink = self.zone_sink(&dest, &outputs).ok()?;
+
+        // Re-check still routed, then cache.
+        let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+        let s = sources.get_mut(source)?;
+        if !s.active || !s.routed {
+            return None;
+        }
+        s.sink = Some(Arc::clone(&sink));
+        Some(sink)
+    }
+
+    /// An AirPlay session ended (FIFO EOF). Clear the source's session state and, if
+    /// it still drives its dest_zone, clear that driver and free any Snapcast slot.
+    pub fn session_ended(&self, source: &str) {
+        let dest = {
+            let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+            let Some(s) = sources.get_mut(source) else { return };
+            s.active = false;
+            s.routed = false;
+            s.sink = None;
+            s.dest_zone.clone()
+        };
+
+        let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+        if let Some(z) = zones.get_mut(&dest) {
+            if matches!(&z.current, Some(ZoneDriver::Airplay(s)) if s == source) {
+                z.current = None;
+            }
+        }
+        drop(zones);
+        self.snapcast.release_zone(&dest);
+
+        self.notify_sources_changed();
+        self.notify_outputs_changed();
+    }
+
+    /// Active AirPlay sessions, for the `sources` push.
+    pub fn list_sources(&self) -> Vec<SourceView> {
+        let sources = self.sources.lock().expect("engine sources mutex poisoned");
+        sources
+            .iter()
+            .filter(|(_, s)| s.active)
+            .map(|(id, s)| SourceView {
+                source: id.clone(),
+                name: s.name.clone(),
+                dest_zone: s.dest_zone.clone(),
+                routed: s.routed,
+            })
+            .collect()
+    }
+
+    /// Notify subscribers that the active-source set/state changed.
+    fn notify_sources_changed(&self) {
+        let _ = SOURCES_CHANGED.send(());
+    }
+
+    /// Turn on AirPlay receiving: install the receiver manager and reconcile it
+    /// (and the logical source registry) against the current zone set, spawning a
+    /// receiver per zone. Idempotent-ish: a second call replaces the manager.
+    pub fn enable_airplay(&self, factory: Box<dyn ReceiverFactory>) {
+        *self.airplay.lock().expect("engine airplay mutex poisoned") =
+            Some(Arc::new(ShairportManager::new(factory)));
+        self.reconcile_airplay();
+    }
+
+    /// Converge the logical source registry and (if AirPlay is enabled) the
+    /// receiver manager to the current zone set. Called after any zone-topology
+    /// change.
+    ///
+    /// Lock discipline: snapshots `desired` under `zones` then releases it before
+    /// locking `sources` or calling `mgr.reconcile` (which may spawn a process in
+    /// production). Callers must NOT hold `zones` or `sources` when calling this.
+    fn reconcile_airplay(&self) {
+        // Desired = every zone (id, name). Snapshot under zones lock, then release.
+        let desired: Vec<(String, String)> = {
+            let zones = self.zones.lock().expect("engine zones mutex poisoned");
+            zones.iter().map(|(id, z)| (id.clone(), z.name.clone())).collect()
+        };
+
+        // Keep the logical source registry in step: an idle source per zone; drop
+        // sources whose zone is gone. Preserve session state for surviving zones.
+        {
+            let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+            let desired_ids: std::collections::HashSet<&str> =
+                desired.iter().map(|(id, _)| id.as_str()).collect();
+            sources.retain(|id, _| desired_ids.contains(id.as_str()));
+            for (id, name) in &desired {
+                sources
+                    .entry(id.clone())
+                    .and_modify(|s| s.name = name.clone())
+                    .or_insert_with(|| SourceState {
+                        name: name.clone(),
+                        dest_zone: id.clone(),
+                        active: false,
+                        routed: false,
+                        sink: None,
+                    });
+            }
+        }
+
+        // Snapshot the manager handle, release the airplay lock, THEN reconcile
+        // outside the zones, sources, and airplay locks (reconcile may spawn a
+        // shairport-sync process in production, so we must not hold any engine
+        // lock across it). The guard is a temporary that drops at the `;`.
+        let mgr = self.airplay.lock().expect("engine airplay mutex poisoned").clone();
+        if let Some(mgr) = mgr {
+            mgr.reconcile(&desired);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Engine {
+    /// True if `id` has an entry in the sources map (regardless of active state).
+    fn has_source(&self, id: &str) -> bool {
+        self.sources.lock().unwrap().contains_key(id)
+    }
+
+    /// Register an idle source (the device-free half of what reconcile installs).
+    fn add_idle_source(&self, id: &str, name: &str) {
+        self.sources.lock().unwrap().insert(
+            id.to_string(),
+            SourceState {
+                name: name.to_string(),
+                dest_zone: id.to_string(),
+                active: false,
+                routed: false,
+                sink: None,
+            },
+        );
+    }
+    fn zone_has_airplay_driver(&self, zone: &str) -> bool {
+        let zones = self.zones.lock().unwrap();
+        matches!(zones.get(zone).and_then(|z| z.current.as_ref()), Some(ZoneDriver::Airplay(_)))
+    }
+    /// Install a URL driver via the same detach path play() uses (device-free:
+    /// caller supplies a dummy pipeline).
+    fn install_url_driver_for_test(&self, zone: &str, pipeline: Pipeline) {
+        let prev = {
+            let mut zones = self.zones.lock().unwrap();
+            let z = zones.get_mut(zone).unwrap();
+            let prev = z.current.take();
+            z.current = Some(ZoneDriver::Url(pipeline));
+            prev
+        };
+        if let Some(prev) = prev {
+            self.detach_driver(prev);
+        }
     }
 }
 
@@ -644,6 +951,107 @@ mod tests {
         engine.delete_zone(&zone).expect("delete");
         assert!(engine.list_zones().into_iter().all(|z| z.zone != zone));
         assert_eq!(engine.delete_zone(&zone).unwrap_err(), "unknown_zone");
+    }
+
+    // A stand-in decode pipeline: a thread that idles until its stop flag is set,
+    // so we can test driver conflict/shutdown without opening an audio device.
+    fn dummy_pipeline() -> Pipeline {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("dummy-pipeline".into())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+            .unwrap();
+        Pipeline { stop, handle }
+    }
+
+    #[test]
+    fn session_began_then_ended_tracks_active_and_clears_driver() {
+        let engine = Engine::new();
+        // Register an idle source for a dongle zone (no device needed to begin).
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_idle_source("d1", "Kitchen"); // test helper, see Step 3
+
+        engine.session_began("d1");
+        let active = engine.list_sources();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].source, "d1");
+        assert_eq!(active[0].dest_zone, "d1");
+        assert!(active[0].routed);
+        // The zone now has an Airplay driver.
+        assert!(engine.zone_has_airplay_driver("d1")); // test helper
+
+        engine.session_ended("d1");
+        assert!(engine.list_sources().is_empty(), "ended -> not active");
+        assert!(!engine.zone_has_airplay_driver("d1"), "driver cleared");
+    }
+
+    #[test]
+    fn url_play_detaches_an_airplay_source_last_wins() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_idle_source("d1", "Kitchen");
+        engine.session_began("d1");
+        assert!(engine.list_sources()[0].routed);
+
+        // Simulate a URL taking over the same zone (device-free: inject a dummy
+        // pipeline as the new driver via the same detach path play() uses).
+        engine.install_url_driver_for_test("d1", dummy_pipeline());
+
+        // The source is still session-active but now unrouted (discarding).
+        let s = &engine.list_sources()[0];
+        assert!(s.active_but_unrouted());
+        // Cleanup: stop the zone (shuts the dummy pipeline).
+        engine.stop("d1");
+    }
+
+    #[test]
+    fn session_began_on_unknown_source_is_noop() {
+        let engine = Engine::new();
+        engine.session_began("ghost");
+        assert!(engine.list_sources().is_empty());
+    }
+
+    #[test]
+    fn enabling_airplay_reconciles_existing_and_new_zones() {
+        use crate::audio::airplay_manager::{ReceiverFactory, ZoneReceiver};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Spy { created: Mutex<Vec<String>> }
+        struct Recv;
+        impl ZoneReceiver for Recv { fn rename(&self, _n: &str) -> Result<(), String> { Ok(()) } }
+        struct SpyFactory { spy: Arc<Spy> }
+        impl ReceiverFactory for SpyFactory {
+            fn create(&self, zone: &str, _name: &str, _slot: usize) -> Result<Box<dyn ZoneReceiver>, String> {
+                self.spy.created.lock().unwrap().push(zone.to_string());
+                Ok(Box::new(Recv))
+            }
+        }
+
+        let engine = Engine::new();
+        let spy = Arc::new(Spy::default());
+        engine.enable_airplay(Box::new(SpyFactory { spy: Arc::clone(&spy) }));
+
+        // Enabling spawns a receiver for the pre-existing default zone, and registers
+        // an idle source for it.
+        {
+            let created = spy.created.lock().unwrap();
+            assert!(created.contains(&"default".to_string()), "default zone got a receiver");
+        }
+        assert!(engine.has_source("default")); // test helper from Task 3 area
+
+        // A new dongle zone reconciles a new receiver + idle source.
+        engine.add_dongle_output("d1", "Kitchen");
+        {
+            let created = spy.created.lock().unwrap();
+            assert!(created.contains(&"d1".to_string()), "dongle zone got a receiver");
+        }
+        assert!(engine.has_source("d1"));
     }
 
     // FanOut forwards writes to every member sink.

@@ -1,4 +1,4 @@
-use crate::audio::engine::{ENGINE, OUTPUTS_CHANGED};
+use crate::audio::engine::{ENGINE, OUTPUTS_CHANGED, SOURCES_CHANGED};
 use crate::json_structs::json_trait::JsonSerializable;
 use crate::json_structs::response_data::SessionKeyResponseData;
 use crate::json_structs::server_response::ServerResponseData;
@@ -67,6 +67,10 @@ impl<'connection> Connection<'connection> {
         if self.send_zones().await.is_err() {
             return Ok(true);
         }
+        let mut sources_changed = SOURCES_CHANGED.subscribe();
+        if self.send_sources().await.is_err() {
+            return Ok(true);
+        }
 
         loop {
             let read_result = tokio::select! {
@@ -80,6 +84,13 @@ impl<'connection> Connection<'connection> {
                         return Ok(true);
                     }
                     if self.send_zones().await.is_err() {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                // Engine → client: AirPlay sources changed, re-push the snapshot.
+                _ = sources_changed.recv() => {
+                    if self.send_sources().await.is_err() {
                         return Ok(true);
                     }
                     continue;
@@ -148,6 +159,7 @@ impl<'connection> Connection<'connection> {
             // so it's handled here rather than in the stateless `dispatch`).
             Some("list_outputs") => return self.send_outputs().await,
             Some("list_zones") => return self.send_zones().await,
+            Some("list_sources") => return self.send_sources().await,
             Some(task_str) => {
                 let task = commands::Task::parse(task_str);
                 commands::dispatch(task, &request["data"])
@@ -186,6 +198,22 @@ impl<'connection> Connection<'connection> {
             }))
             .collect();
         let response = TaskResponse::accepted("zones", Some(json!({ "zones": zones })));
+        self.send_encrypted(&response.to_json()).await
+    }
+
+    /// Push currently-active AirPlay sessions to this client as an encrypted
+    /// `{"status":"ok","task":"sources","data":{"sources":[...]}}` message. Sent on
+    /// connect, on every SOURCES_CHANGED tick, and on a `list_sources` request.
+    async fn send_sources(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sources: Vec<serde_json::Value> = ENGINE
+            .list_sources()
+            .into_iter()
+            .map(|s| json!({
+                "source": s.source, "name": s.name, "dest_zone": s.dest_zone,
+                "active": true, "routed": s.routed
+            }))
+            .collect();
+        let response = TaskResponse::accepted("sources", Some(json!({ "sources": sources })));
         self.send_encrypted(&response.to_json()).await
     }
 
