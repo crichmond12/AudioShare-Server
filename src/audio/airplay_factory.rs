@@ -52,7 +52,6 @@ impl ReceiverFactory for ShairportReceiverFactory {
         };
 
         Ok(Box::new(ShairportReceiver {
-            name: Mutex::new(name.to_string()),
             slot,
             supervisor,
             stop,
@@ -65,7 +64,6 @@ impl ReceiverFactory for ShairportReceiverFactory {
 /// One live receiver: the supervised process + its pump thread. Drop tears both
 /// down (stop the pump, kill shairport via the supervisor's own Drop).
 struct ShairportReceiver {
-    name: Mutex<String>,
     slot: usize,
     supervisor: Mutex<Option<ShairportSupervisor>>,
     stop: Arc<AtomicBool>,
@@ -79,7 +77,6 @@ impl ZoneReceiver for ShairportReceiver {
         // (and its FIFO) are unaffected.
         let next = ShairportSupervisor::spawn_for_slot(new_name, self.slot)?;
         *self.supervisor.lock().expect("supervisor mutex poisoned") = Some(next);
-        *self.name.lock().expect("name mutex poisoned") = new_name.to_string();
         Ok(())
     }
 }
