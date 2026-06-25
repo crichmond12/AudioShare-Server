@@ -38,7 +38,7 @@ const SHAIRPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
 
 /// Base RTSP port for classic shairport-sync instances; instance `slot` uses
 /// `RTSP_PORT_BASE + slot`. Classic AirPlay needs a distinct port per instance.
-pub const RTSP_PORT_BASE: u16 = 5000;
+pub const RTSP_PORT_BASE: u16 = 5055;
 
 /// RTSP port for receiver `slot`.
 pub fn slot_port(slot: usize) -> u16 {
@@ -352,8 +352,8 @@ mod tests {
 
     #[test]
     fn slot_maps_to_unique_port_and_device_id() {
-        assert_eq!(slot_port(0), 5000);
-        assert_eq!(slot_port(3), 5003);
+        assert_eq!(slot_port(0), RTSP_PORT_BASE);
+        assert_eq!(slot_port(3), RTSP_PORT_BASE + 3);
         // Device ids are stable and distinct per slot.
         assert_ne!(slot_device_id(0), slot_device_id(1));
         assert_eq!(slot_device_id(0), slot_device_id(0));
