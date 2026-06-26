@@ -33,6 +33,12 @@ impl ReceiverFactory for ShairportReceiverFactory {
         let fifo = airplay::fifo_path(slot);
         let stop = Arc::new(AtomicBool::new(false));
 
+        // Ensure the meta FIFO exists up front, so the only fallible step left
+        // after the pump spawn is the meta-thread spawn itself (whose error path
+        // tears the pump back down — a dropped JoinHandle detaches, never joins).
+        let meta_fifo = airplay::meta_fifo_path(slot);
+        airplay::ensure_fifo(&meta_fifo)?;
+
         // The pump thread: bracket sessions via the FIFO, route per chunk.
         let pump = {
             let sessions = Arc::clone(&self.sessions);
@@ -52,11 +58,9 @@ impl ReceiverFactory for ShairportReceiverFactory {
                 .map_err(|e| format!("failed to spawn airplay pump thread: {e}"))?
         };
 
-        // Metadata reader: ensure the meta FIFO exists, then pump shairport's
-        // metadata stream into the engine via the accumulator. Runs continuously
-        // (independent of the audio session), survives renames (FIFO persists).
-        let meta_fifo = airplay::meta_fifo_path(slot);
-        airplay::ensure_fifo(&meta_fifo)?;
+        // Metadata reader: pump shairport's metadata stream into the engine via
+        // the accumulator. Runs continuously (independent of the audio session),
+        // survives renames (FIFO persists).
         let meta = {
             let sessions = Arc::clone(&self.sessions);
             let source = zone.to_string();
@@ -80,7 +84,18 @@ impl ReceiverFactory for ShairportReceiverFactory {
                         eprintln!("airplay metadata reader for {source} ended: {e}");
                     }
                 })
-                .map_err(|e| format!("failed to spawn airplay metadata thread: {e}"))?
+        };
+        let meta = match meta {
+            Ok(handle) => handle,
+            Err(e) => {
+                // The pump is already spawned; dropping its handle would detach it
+                // and leak the thread parked on a blocking FIFO open. Tear it down
+                // the same way Drop does: stop, nudge the audio FIFO open, join.
+                stop.store(true, Ordering::Relaxed);
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                let _ = pump.join();
+                return Err(format!("failed to spawn airplay metadata thread: {e}"));
+            }
         };
 
         Ok(Box::new(ShairportReceiver {
@@ -130,11 +145,13 @@ impl Drop for ShairportReceiver {
                 let _ = f.write_all(&[]);
             }
         }
-        if let Some(handle) = self.pump.lock().expect("pump mutex poisoned").take() {
-            let _ = handle.join();
+        let pump = self.pump.lock().expect("pump mutex poisoned").take();
+        if let Some(h) = pump {
+            let _ = h.join();
         }
-        if let Some(handle) = self.meta.lock().expect("meta mutex poisoned").take() {
-            let _ = handle.join();
+        let meta = self.meta.lock().expect("meta mutex poisoned").take();
+        if let Some(h) = meta {
+            let _ = h.join();
         }
     }
 }
