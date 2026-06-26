@@ -13,6 +13,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::audio::airplay::{self, ShairportSupervisor};
 use crate::audio::airplay_manager::{ReceiverFactory, ZoneReceiver};
+use crate::audio::airplay_meta::{self, MetaAccumulator, MetaCommit};
 use crate::audio::engine::SessionSink;
 
 /// Builds real `shairport-sync`-backed receivers wired into the engine.
@@ -51,12 +52,45 @@ impl ReceiverFactory for ShairportReceiverFactory {
                 .map_err(|e| format!("failed to spawn airplay pump thread: {e}"))?
         };
 
+        // Metadata reader: ensure the meta FIFO exists, then pump shairport's
+        // metadata stream into the engine via the accumulator. Runs continuously
+        // (independent of the audio session), survives renames (FIFO persists).
+        let meta_fifo = airplay::meta_fifo_path(slot);
+        airplay::ensure_fifo(&meta_fifo)?;
+        let meta = {
+            let sessions = Arc::clone(&self.sessions);
+            let source = zone.to_string();
+            let stop = Arc::clone(&stop);
+            let meta_fifo = meta_fifo.clone();
+            thread::Builder::new()
+                .name(format!("airplay-meta-{slot}"))
+                .spawn(move || {
+                    let mut acc = MetaAccumulator::new();
+                    let result = airplay_meta::run_metadata_reader(&meta_fifo, &stop, |ev| {
+                        if let Some(commit) = acc.apply(ev) {
+                            match commit {
+                                MetaCommit::Track { title, artist, album, client } => {
+                                    sessions.track_update(&source, &title, &artist, &album, &client);
+                                }
+                                MetaCommit::Art(bytes) => sessions.art_update(&source, &bytes),
+                            }
+                        }
+                    });
+                    if let Err(e) = result {
+                        eprintln!("airplay metadata reader for {source} ended: {e}");
+                    }
+                })
+                .map_err(|e| format!("failed to spawn airplay metadata thread: {e}"))?
+        };
+
         Ok(Box::new(ShairportReceiver {
             slot,
             supervisor,
             stop,
             pump: Mutex::new(Some(pump)),
+            meta: Mutex::new(Some(meta)),
             fifo,
+            meta_fifo,
         }))
     }
 }
@@ -68,7 +102,9 @@ struct ShairportReceiver {
     supervisor: Mutex<Option<ShairportSupervisor>>,
     stop: Arc<AtomicBool>,
     pump: Mutex<Option<JoinHandle<()>>>,
+    meta: Mutex<Option<JoinHandle<()>>>,
     fifo: PathBuf,
+    meta_fifo: PathBuf,
 }
 
 impl ZoneReceiver for ShairportReceiver {
@@ -83,19 +119,21 @@ impl ZoneReceiver for ShairportReceiver {
 
 impl Drop for ShairportReceiver {
     fn drop(&mut self) {
-        // Stop the pump first so it isn't blocked on a FIFO that no writer will
-        // ever open again; then drop the supervisor (kills shairport).
+        // Stop both readers first so neither blocks on a FIFO no writer will reopen.
         self.stop.store(true, Ordering::Relaxed);
-        // The pump may be parked in a blocking FIFO open with no writer. Drop the
-        // supervisor to kill shairport, then nudge the open by briefly opening the
-        // write end ourselves so the parked open returns and the thread observes
-        // `stop`. (Best-effort; a half-open FIFO read returns EOF on our close.)
+        // Drop the supervisor (kills shairport), then nudge each blocking FIFO open
+        // by briefly opening the write end so parked opens return and observe `stop`.
         *self.supervisor.lock().expect("supervisor mutex poisoned") = None;
-        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&self.fifo) {
-            use std::io::Write;
-            let _ = f.write_all(&[]);
+        for fifo in [&self.fifo, &self.meta_fifo] {
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(fifo) {
+                use std::io::Write;
+                let _ = f.write_all(&[]);
+            }
         }
         if let Some(handle) = self.pump.lock().expect("pump mutex poisoned").take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.meta.lock().expect("meta mutex poisoned").take() {
             let _ = handle.join();
         }
     }
