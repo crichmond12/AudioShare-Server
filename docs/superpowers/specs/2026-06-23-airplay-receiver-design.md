@@ -298,6 +298,24 @@ Each slice ends at something demoable; the most-additive UX lands last.
 - **Slice 3 — Track metadata + album art.** Full metadata-pipe parse
   (title/artist/album, `PICT`), art cache keyed by hash, `get_art` task, `art_id`
   in the push. *Demo:* the app shows now-playing title/artist/album + art.
+
+  > **As planned — Slice 3 decisions:**
+  > - **Session lifecycle unchanged.** The audio FIFO still brackets the session
+  >   (open = active, EOF = ended), per the Slice 2 deviation note above. The
+  >   metadata pipe is consumed **only** for track info; it does not drive
+  >   `pbeg`/`pend` session start/end. The metadata reader runs continuously while
+  >   the instance is up (and survives a rename, since the FIFO persists — same as
+  >   the audio pump).
+  > - **`client` field is best-effort.** Parse the sender's device name when
+  >   shairport surfaces it (e.g. `ssnc`/`snua` user-agent / DACP side); send an
+  >   empty string when absent. Not a blocker for the slice.
+  > - **Art cache = one latest image per source**, keyed by its content hash. A
+  >   `get_art` with a stale `art_id` (art changed underneath) returns
+  >   `unknown_art`. Bounds memory to ~one image per receiver.
+  > - **`art_id` = SHA-256 hex** of the current image bytes (via the existing
+  >   `sha2` crate; `base64` is likewise already a dependency — no new crates).
+  > - **`session_ended` clears** the source's track metadata and cached art; every
+  >   track/art change fires `SOURCES_CHANGED`.
 - **Slice 4 — Reroute.** The `reroute` task + engine reroute op + last-wins on
   the target zone. *Demo:* audio playing to Kitchen; tap in the app → it moves to
   Living Room with the phone still connected to the Kitchen receiver.
