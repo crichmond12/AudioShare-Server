@@ -112,6 +112,8 @@ mod tests {
         fn session_began(&self, _s: &str) {}
         fn sink_for_source(&self, _s: &str) -> Option<Arc<dyn AudioSink>> { None }
         fn session_ended(&self, _s: &str) {}
+        fn track_update(&self, _s: &str, _title: &str, _artist: &str, _album: &str, _client: &str) {}
+        fn art_update(&self, _s: &str, _image: &[u8]) {}
     }
 
     #[test]

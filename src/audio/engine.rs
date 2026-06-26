@@ -64,6 +64,10 @@ pub trait SessionSink: Send + Sync {
     fn session_began(&self, source: &str);
     fn sink_for_source(&self, source: &str) -> Option<Arc<dyn AudioSink>>;
     fn session_ended(&self, source: &str);
+    /// Slice 3: replace the source's track fields (empty `client` leaves it as-is).
+    fn track_update(&self, source: &str, title: &str, artist: &str, album: &str, client: &str);
+    /// Slice 3: a new album-art image arrived for the source.
+    fn art_update(&self, source: &str, image: &[u8]);
 }
 
 impl SessionSink for &'static Engine {
@@ -72,6 +76,10 @@ impl SessionSink for &'static Engine {
         Engine::sink_for_source(self, source)
     }
     fn session_ended(&self, source: &str) { Engine::session_ended(self, source); }
+    fn track_update(&self, source: &str, title: &str, artist: &str, album: &str, client: &str) {
+        Engine::track_update(self, source, title, artist, album, client);
+    }
+    fn art_update(&self, source: &str, image: &[u8]) { Engine::art_update(self, source, image); }
 }
 
 /// Name of a zone (a group of outputs sharing playback).
@@ -108,6 +116,19 @@ struct SourceState {
     active: bool,      // a session is in progress (FIFO open)
     routed: bool,      // currently dest_zone's driver (false = connected-but-unrouted)
     sink: Option<Arc<dyn AudioSink>>, // cached resolved sink while active+routed
+    // Slice 3: latest now-playing info; cleared on session end.
+    title: String,
+    artist: String,
+    album: String,
+    client: String,
+    art_id: String, // sha256 hex of current art; "" when none
+}
+
+/// One cached album-art image (the latest for a source).
+struct ArtImage {
+    art_id: String,
+    mime: String,
+    bytes: Vec<u8>,
 }
 
 /// A source as reported to clients (active sessions only).
@@ -116,6 +137,12 @@ pub struct SourceView {
     pub name: String,
     pub dest_zone: ZoneId,
     pub routed: bool,
+    // Slice 3:
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub client: String,
+    pub art_id: String,
 }
 
 impl SourceView {
@@ -159,6 +186,9 @@ pub struct Engine {
     /// `Arc` so `reconcile_airplay` can clone the handle and release the lock
     /// before calling `reconcile` (which may spawn a process in production).
     airplay: Mutex<Option<Arc<ShairportManager>>>,
+    /// One latest album-art image per source id (Slice 3). Independent mutex;
+    /// taken only after releasing `sources`.
+    art_cache: Mutex<HashMap<ZoneId, ArtImage>>,
 }
 
 impl Engine {
@@ -180,6 +210,7 @@ impl Engine {
             snapcast: SnapcastRouter::new(),
             sources: Mutex::new(HashMap::new()),
             airplay: Mutex::new(None),
+            art_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -553,6 +584,12 @@ impl Engine {
             s.active = false;
             s.routed = false;
             s.sink = None;
+            // Slice 3: now-playing is session-scoped.
+            s.title.clear();
+            s.artist.clear();
+            s.album.clear();
+            s.client.clear();
+            s.art_id.clear();
             s.dest_zone.clone()
         };
 
@@ -564,6 +601,10 @@ impl Engine {
         }
         drop(zones);
         self.snapcast.release_zone(&dest);
+        self.art_cache
+            .lock()
+            .expect("engine art cache mutex poisoned")
+            .remove(source);
 
         self.notify_sources_changed();
         self.notify_outputs_changed();
@@ -580,8 +621,56 @@ impl Engine {
                 name: s.name.clone(),
                 dest_zone: s.dest_zone.clone(),
                 routed: s.routed,
+                title: s.title.clone(),
+                artist: s.artist.clone(),
+                album: s.album.clone(),
+                client: s.client.clone(),
+                art_id: s.art_id.clone(),
             })
             .collect()
+    }
+
+    /// Replace the source's track fields. An empty `client` leaves the existing
+    /// value (shairport sends it sparsely). Fires SOURCES_CHANGED.
+    pub fn track_update(&self, source: &str, title: &str, artist: &str, album: &str, client: &str) {
+        {
+            let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+            let Some(s) = sources.get_mut(source) else { return };
+            s.title = title.to_string();
+            s.artist = artist.to_string();
+            s.album = album.to_string();
+            if !client.is_empty() {
+                s.client = client.to_string();
+            }
+        }
+        self.notify_sources_changed();
+    }
+
+    /// A new album-art image arrived for `source`: hash it (sha256 hex), sniff its
+    /// mime, cache one image per source, and record its id on the source. Fires
+    /// SOURCES_CHANGED.
+    pub fn art_update(&self, source: &str, image: &[u8]) {
+        let art_id = sha256::digest(image);
+        let mime = sniff_mime(image).to_string();
+        {
+            let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+            let Some(s) = sources.get_mut(source) else { return };
+            s.art_id = art_id.clone();
+        }
+        self.art_cache
+            .lock()
+            .expect("engine art cache mutex poisoned")
+            .insert(source.to_string(), ArtImage { art_id, mime, bytes: image.to_vec() });
+        self.notify_sources_changed();
+    }
+
+    /// Look up a cached image by its content hash. `None` => `unknown_art`.
+    pub fn get_art(&self, art_id: &str) -> Option<(String, Vec<u8>)> {
+        let cache = self.art_cache.lock().expect("engine art cache mutex poisoned");
+        cache
+            .values()
+            .find(|a| a.art_id == art_id)
+            .map(|a| (a.mime.clone(), a.bytes.clone()))
     }
 
     /// Notify subscribers that the active-source set/state changed.
@@ -629,6 +718,11 @@ impl Engine {
                         active: false,
                         routed: false,
                         sink: None,
+                        title: String::new(),
+                        artist: String::new(),
+                        album: String::new(),
+                        client: String::new(),
+                        art_id: String::new(),
                     });
             }
         }
@@ -661,6 +755,11 @@ impl Engine {
                 active: false,
                 routed: false,
                 sink: None,
+                title: String::new(),
+                artist: String::new(),
+                album: String::new(),
+                client: String::new(),
+                art_id: String::new(),
             },
         );
     }
@@ -687,6 +786,17 @@ impl Engine {
 impl Default for Engine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Best-effort image mime from magic bytes; AirPlay art is JPEG or PNG.
+fn sniff_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else {
+        "application/octet-stream"
     }
 }
 
@@ -1052,6 +1162,51 @@ mod tests {
             assert!(created.contains(&"d1".to_string()), "dongle zone got a receiver");
         }
         assert!(engine.has_source("d1"));
+    }
+
+    #[test]
+    fn track_and_art_update_populate_source_view() {
+        let engine = Engine::new();
+        engine.add_idle_source("default", "Hub");
+        engine.session_began("default"); // active so list_sources reports it
+
+        engine.track_update("default", "Song", "Artist", "Album", "Chris's iPhone");
+        engine.art_update("default", &[0xFF, 0xD8, 0xFF, 1, 2, 3]); // JPEG magic
+
+        let views = engine.list_sources();
+        let v = views.iter().find(|v| v.source == "default").expect("source present");
+        assert_eq!(v.title, "Song");
+        assert_eq!(v.artist, "Artist");
+        assert_eq!(v.album, "Album");
+        assert_eq!(v.client, "Chris's iPhone");
+        assert!(!v.art_id.is_empty());
+
+        // get_art returns the cached image + sniffed mime.
+        let (mime, bytes) = engine.get_art(&v.art_id).expect("art cached");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(bytes, vec![0xFF, 0xD8, 0xFF, 1, 2, 3]);
+    }
+
+    #[test]
+    fn get_art_unknown_id_returns_none() {
+        let engine = Engine::new();
+        assert!(engine.get_art("deadbeef").is_none());
+    }
+
+    #[test]
+    fn session_ended_clears_track_and_art() {
+        let engine = Engine::new();
+        engine.add_idle_source("default", "Hub");
+        engine.session_began("default");
+        engine.track_update("default", "Song", "Artist", "Album", "Phone");
+        engine.art_update("default", &[0x89, b'P', b'N', b'G', 9]);
+        let art_id = engine.list_sources()[0].art_id.clone();
+
+        engine.session_ended("default");
+
+        // Source is now inactive (not in list_sources), and its art is evicted.
+        assert!(engine.list_sources().is_empty());
+        assert!(engine.get_art(&art_id).is_none());
     }
 
     // FanOut forwards writes to every member sink.
