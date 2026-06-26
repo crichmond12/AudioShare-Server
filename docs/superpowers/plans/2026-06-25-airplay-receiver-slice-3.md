@@ -144,7 +144,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib audio::airplay_meta`
+Run: `cargo test --bin audio_share audio::airplay_meta`
 Expected: FAIL to compile — `parse_items`/`MetaEvent` not found.
 
 - [ ] **Step 3: Write the parser**
@@ -272,7 +272,7 @@ pub mod airplay_meta;
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib audio::airplay_meta`
+Run: `cargo test --bin audio_share audio::airplay_meta`
 Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
@@ -343,7 +343,7 @@ Add to the `tests` module in `src/audio/airplay_meta.rs`:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib audio::airplay_meta`
+Run: `cargo test --bin audio_share audio::airplay_meta`
 Expected: FAIL to compile — `MetaAccumulator`/`MetaCommit` not found.
 
 - [ ] **Step 3: Implement the accumulator**
@@ -395,7 +395,7 @@ impl MetaAccumulator {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib audio::airplay_meta`
+Run: `cargo test --bin audio_share audio::airplay_meta`
 Expected: PASS (8 tests total).
 
 - [ ] **Step 5: Commit**
@@ -504,7 +504,7 @@ Add to the `tests` module in `src/audio/airplay_meta.rs`:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib audio::airplay`
+Run: `cargo test --bin audio_share audio::airplay`
 Expected: FAIL to compile — `meta_fifo_path` / `run_metadata_reader` not found, `metadata =` not in config.
 
 - [ ] **Step 3: Implement config + paths + reader**
@@ -600,7 +600,7 @@ pub fn run_metadata_reader(
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib audio::airplay`
+Run: `cargo test --bin audio_share audio::airplay`
 Expected: PASS (existing airplay tests + `meta_fifo_path_is_indexed`, `config_enables_metadata_pipe`, `reader_parses_events_until_eof`).
 
 - [ ] **Step 5: Commit**
@@ -682,7 +682,7 @@ Add to the `tests` module in `src/audio/engine.rs` (it already has `add_idle_sou
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib audio::engine`
+Run: `cargo test --bin audio_share audio::engine`
 Expected: FAIL to compile — `track_update`/`art_update`/`get_art` not found, `SourceView` lacks `title`.
 
 - [ ] **Step 3: Implement engine state + methods**
@@ -907,7 +907,7 @@ Update `session_ended` to clear track + art. In its `sources` lock block, after 
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib audio::engine`
+Run: `cargo test --bin audio_share audio::engine`
 Expected: PASS (existing engine tests + the three new ones).
 
 - [ ] **Step 5: Commit**
@@ -950,7 +950,7 @@ In `src/audio/airplay_factory.rs`, update `NoSessions` to satisfy the new trait 
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test --lib audio::airplay_factory`
+Run: `cargo test --bin audio_share audio::airplay_factory`
 Expected: FAIL to compile — `NoSessions` doesn't implement the new trait methods (and the production `ShairportReceiver` doesn't yet spawn/stop the meta thread, but compilation fails first on the trait).
 
 - [ ] **Step 3: Spawn + tear down the metadata reader**
@@ -1053,7 +1053,7 @@ impl Drop for ShairportReceiver {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib audio::airplay_factory`
+Run: `cargo test --bin audio_share audio::airplay_factory`
 Expected: PASS (`factory_constructs_without_spawning`). Then build the whole crate: `cargo build` → success.
 
 - [ ] **Step 5: Commit**
@@ -1109,7 +1109,7 @@ Add to the `tests` module in `src/server/commands.rs`:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib server::commands`
+Run: `cargo test --bin audio_share server::commands`
 Expected: FAIL to compile — `Task::GetArt` not found.
 
 - [ ] **Step 3: Implement the task + dispatch + push fields**
@@ -1170,7 +1170,7 @@ In `src/server/connection.rs`, extend the `send_sources` JSON map to include the
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib server::commands`
+Run: `cargo test --bin audio_share server::commands`
 Expected: PASS (`parses_get_art_task`, `get_art_unknown_id_errors`, `get_art_without_id_errors` + existing). Then `cargo build` → success.
 
 - [ ] **Step 5: Commit**
@@ -1252,7 +1252,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 - [ ] **Run the full device-free test suite**
 
-Run: `cargo test --lib`
+Run: `cargo test --bin audio_share`
 Expected: PASS — all new tests (`audio::airplay_meta` ×9, `audio::airplay` config/path, `audio::engine` ×3, `server::commands` ×3) plus the pre-existing suite, no regressions.
 
 - [ ] **Build the whole workspace**
