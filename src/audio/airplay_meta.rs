@@ -9,6 +9,54 @@
 //! Session lifecycle is NOT driven here — the audio FIFO brackets the session
 //! (Slice 2 deviation). `pbeg`/`pend` are parsed-and-ignored.
 
+use std::fs::File;
+use std::io::{ErrorKind, Read};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Continuously read the metadata FIFO, parsing items into [`MetaEvent`]s passed
+/// to `on_event`, until `stop`. Each blocking open returns when shairport opens
+/// the write end; EOF (shairport closed/restarted) reopens. A partial item at a
+/// read boundary is carried in `remainder` to the next read. Mirrors
+/// `airplay::run_receiver`'s reopen loop; lifecycle is the audio FIFO's job, not
+/// this reader's.
+pub fn run_metadata_reader(
+    meta_fifo: &Path,
+    stop: &Arc<AtomicBool>,
+    mut on_event: impl FnMut(MetaEvent),
+) -> Result<(), String> {
+    while !stop.load(Ordering::Relaxed) {
+        let mut file = match File::open(meta_fifo) {
+            Ok(f) => f,
+            Err(e) => return Err(format!("open airplay meta fifo {} failed: {e}", meta_fifo.display())),
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut remainder: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let n = match file.read(&mut buf) {
+                Ok(0) => break, // EOF: shairport closed; reopen
+                Ok(n) => n,
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("airplay meta fifo read error: {e}")),
+            };
+            remainder.extend_from_slice(&buf[..n]);
+            let (events, consumed) = parse_items(&remainder);
+            for ev in events {
+                on_event(ev);
+            }
+            remainder.drain(..consumed);
+        }
+    }
+    Ok(())
+}
+
 /// A decoded event from the metadata pipe. Payloads are already base64-decoded:
 /// text is UTF-8 (lossy), `Art` is the raw image bytes.
 #[derive(Debug, Clone, PartialEq)]
@@ -262,5 +310,58 @@ mod tests {
             }
             _ => panic!("expected Track"),
         }
+    }
+
+    #[test]
+    fn reader_parses_events_until_eof() {
+        use std::ffi::CString;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let path = std::env::temp_dir().join(format!("as-airplay-meta-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo failed");
+
+        // Writer: one title item, then close (EOF).
+        let type_hex: String = "core".bytes().map(|b| format!("{:02x}", b)).collect();
+        let code_hex: String = "minm".bytes().map(|b| format!("{:02x}", b)).collect();
+        let b64 = {
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine as _;
+            STANDARD.encode(b"Hello")
+        };
+        let payload = format!(
+            "<item><type>{type_hex}</type><code>{code_hex}</code><length>5</length>\n\
+             <data encoding=\"base64\">\n{b64}</data></item>"
+        );
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&writer_path).unwrap();
+            f.write_all(payload.as_bytes()).unwrap();
+            // drop -> EOF
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let reader_stop = Arc::clone(&stop);
+        let reader_got = Arc::clone(&got);
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let one_shot = Arc::clone(&reader_stop);
+            let _ = run_metadata_reader(&reader_path, &reader_stop, |ev| {
+                reader_got.lock().unwrap().push(ev);
+                // First event observed: stop so the reopen loop terminates.
+                one_shot.store(true, Ordering::Relaxed);
+            });
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let events = got.lock().unwrap();
+        assert!(matches!(events.first(), Some(MetaEvent::Title(t)) if t == "Hello"), "{events:?}");
     }
 }
