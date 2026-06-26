@@ -109,6 +109,47 @@ fn string_of(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// A commit point produced by [`MetaAccumulator`]: either a full track snapshot
+/// (on bundle end) or a new album-art image (immediately).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetaCommit {
+    Track { title: String, artist: String, album: String, client: String },
+    Art(Vec<u8>),
+}
+
+/// Folds a stream of [`MetaEvent`]s into [`MetaCommit`]s. Text fields accumulate
+/// and commit together on `BundleEnd`; art commits on arrival. Fields persist
+/// across bundles (shairport re-sends the full bundle per track).
+#[derive(Default)]
+pub struct MetaAccumulator {
+    title: String,
+    artist: String,
+    album: String,
+    client: String,
+}
+
+impl MetaAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn apply(&mut self, ev: MetaEvent) -> Option<MetaCommit> {
+        match ev {
+            MetaEvent::Title(t) => { self.title = t; None }
+            MetaEvent::Artist(a) => { self.artist = a; None }
+            MetaEvent::Album(l) => { self.album = l; None }
+            MetaEvent::Client(c) => { self.client = c; None }
+            MetaEvent::Art(bytes) => Some(MetaCommit::Art(bytes)),
+            MetaEvent::BundleEnd => Some(MetaCommit::Track {
+                title: self.title.clone(),
+                artist: self.artist.clone(),
+                album: self.album.clone(),
+                client: self.client.clone(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +227,40 @@ mod tests {
         let (events, consumed) = parse_items(&buf);
         assert!(events.is_empty());
         assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn accumulator_commits_track_on_bundle_end() {
+        let mut acc = MetaAccumulator::new();
+        assert_eq!(acc.apply(MetaEvent::Title("S".into())), None);
+        assert_eq!(acc.apply(MetaEvent::Artist("A".into())), None);
+        assert_eq!(acc.apply(MetaEvent::Album("L".into())), None);
+        let commit = acc.apply(MetaEvent::BundleEnd).expect("commit on mden");
+        assert_eq!(
+            commit,
+            MetaCommit::Track { title: "S".into(), artist: "A".into(), album: "L".into(), client: String::new() }
+        );
+    }
+
+    #[test]
+    fn accumulator_emits_art_immediately() {
+        let mut acc = MetaAccumulator::new();
+        let commit = acc.apply(MetaEvent::Art(vec![1, 2, 3])).expect("art commits now");
+        assert_eq!(commit, MetaCommit::Art(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn accumulator_persists_client_across_bundles() {
+        let mut acc = MetaAccumulator::new();
+        acc.apply(MetaEvent::Client("Chris's iPhone".into()));
+        acc.apply(MetaEvent::Title("S".into()));
+        let commit = acc.apply(MetaEvent::BundleEnd).unwrap();
+        match commit {
+            MetaCommit::Track { client, title, .. } => {
+                assert_eq!(client, "Chris's iPhone");
+                assert_eq!(title, "S");
+            }
+            _ => panic!("expected Track"),
+        }
     }
 }
