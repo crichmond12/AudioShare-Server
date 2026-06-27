@@ -113,6 +113,29 @@ does not leak across sessions.
 (`session_began` already reads `s.dest_zone` to choose its destination, so no
 change is needed there — after revert it naturally reads the home zone.)
 
+## Receiver name during reroute (constraint, not a choice)
+
+Reroute mutates only the internal `dest_zone`; it **never** changes the receiver's
+advertised Bonjour/mDNS name. After a Kitchen → Office reroute, the phone stays
+connected to the **Kitchen** receiver and its native AirPlay menu keeps showing
+**"Kitchen"**, while audio plays out of the **Office** zone.
+
+This name/destination mismatch is intentional and is also a hard constraint of
+classic AirPlay: a session is bound to a fixed Bonjour service name, so renaming a
+live receiver requires restarting its `shairport-sync` instance, which tears down
+the RTSP session — i.e. it **disconnects the phone**. That would defeat reroute's
+whole promise (the phone stays connected while we redirect internally). The only
+time a receiver's name changes is `rename_zone` (Slice 2), which already restarts
+it. Consequently:
+
+- **iPhone AirPlay name = which receiver (source) the user picked** — "what am I
+  streaming *from*."
+- **Our app = where it's actually playing (`dest_zone`)** — "where is the sound
+  *now*." The `sources` push carries `dest_zone` precisely so the app can render
+  "Kitchen receiver → playing in Office"; the iPhone menu cannot convey this once
+  rerouted. This is why the now-playing/reroute view lives in our app, per locked
+  decision #2 (sources decoupled from destinations).
+
 ## Wire protocol additions
 
 Uses the existing encrypted + newline-framed channel and the standard
