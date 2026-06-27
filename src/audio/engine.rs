@@ -590,6 +590,21 @@ impl Engine {
         //    entirely unchanged (still routed to old_dest).
         let sink = self.zone_sink(new_zone, &outputs)?;
 
+        // 5. Point the source at the new zone and cache the resolved sink FIRST,
+        //    before releasing the old Snapcast slot. The pump's `sink_for_source`
+        //    reads this cached sink, so caching the new one ahead of the old-slot
+        //    release closes the window where a concurrent pump write could land on
+        //    an already-released slot (5a's `detach_driver` may join a slow decode
+        //    thread).
+        {
+            let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+            if let Some(s) = sources.get_mut(source) {
+                s.dest_zone = new_zone.to_string();
+                s.routed = true;
+                s.sink = Some(Arc::clone(&sink));
+            }
+        }
+
         // 5a. Detach this source from its old zone — only if it still drives it
         //     (it may have gone connected-but-unrouted). Free the old Snapcast slot
         //     only when we actually owned that zone.
@@ -617,16 +632,9 @@ impl Engine {
             self.detach_driver(prev);
         }
 
-        // 5c. Point the source at the new zone, cache the resolved sink, install it
-        //     as the new zone's driver.
-        {
-            let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
-            if let Some(s) = sources.get_mut(source) {
-                s.dest_zone = new_zone.to_string();
-                s.routed = true;
-                s.sink = Some(Arc::clone(&sink));
-            }
-        }
+        // 5c. Install the source as the new zone's driver. The source's cached
+        //     `sink` (set above) is the pump's source of truth for routing; this
+        //     zone-driver install is bookkeeping for last-wins / `session_ended`.
         {
             let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
             if let Some(z) = zones.get_mut(new_zone) {
@@ -883,6 +891,10 @@ impl Engine {
         }
     }
 
+    // The two helpers below fake an inconsistent intermediate reroute state on
+    // purpose: real `reroute` clears the old zone's driver in step 5a, but these
+    // mutate dest/driver directly without that clear. That's fine for what the
+    // tests assert (revert-to-home and rerouted-zone-driver cleanup on session end).
     #[cfg(test)]
     fn force_dest_zone(&self, source: &str, zone: &str) {
         let mut sources = self.sources.lock().unwrap();

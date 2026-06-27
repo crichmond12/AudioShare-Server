@@ -333,5 +333,6 @@ mod tests {
         let json = dispatch(Task::Reroute, &json!({ "source": "kitchen" })).to_json();
         assert!(json.contains("\"status\":\"error\""));
         assert!(json.contains("\"error\":\"missing_zone\""));
+        assert!(json.contains("\"task\":\"reroute\""));
     }
 }
