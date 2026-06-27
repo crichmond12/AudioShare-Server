@@ -683,6 +683,7 @@ impl Engine {
             s.active = false;
             s.routed = false;
             s.sink = None;
+            let dest = s.dest_zone.clone(); // the zone it was actually routed to (maybe rerouted)
             s.dest_zone = source.to_string(); // revert-to-home: reroute is per-session
             // Slice 3: now-playing is session-scoped.
             s.title.clear();
@@ -690,7 +691,7 @@ impl Engine {
             s.album.clear();
             s.client.clear();
             s.art_id.clear();
-            s.dest_zone.clone()
+            dest
         };
 
         let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
@@ -887,6 +888,14 @@ impl Engine {
         let mut sources = self.sources.lock().unwrap();
         if let Some(s) = sources.get_mut(source) {
             s.dest_zone = zone.to_string();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_airplay_driver_for_test(&self, zone: &str, source: &str) {
+        let mut zones = self.zones.lock().unwrap();
+        if let Some(z) = zones.get_mut(zone) {
+            z.current = Some(ZoneDriver::Airplay(source.to_string()));
         }
     }
 }
@@ -1414,6 +1423,20 @@ mod tests {
         let s = &engine.list_sources()[0];
         assert_eq!(s.dest_zone, "d1");
         assert!(s.routed);
+    }
+
+    #[test]
+    fn session_ended_clears_rerouted_zone_driver() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_dongle_output("d2", "Office");
+        engine.add_idle_source("d1", "Kitchen");
+        engine.session_began("d1"); // driver Airplay("d1") on zone d1, dest == d1
+        // Simulate a reroute to d2 device-free: move dest + install the driver on d2.
+        engine.force_dest_zone("d1", "d2");
+        engine.set_airplay_driver_for_test("d2", "d1");
+        engine.session_ended("d1");
+        assert!(!engine.zone_has_airplay_driver("d2"), "rerouted zone driver cleared on session end");
     }
 
     #[test]
