@@ -316,9 +316,15 @@ Each slice ends at something demoable; the most-additive UX lands last.
   >   `sha2` crate; `base64` is likewise already a dependency — no new crates).
   > - **`session_ended` clears** the source's track metadata and cached art; every
   >   track/art change fires `SOURCES_CHANGED`.
-- **Slice 4 — Reroute.** The `reroute` task + engine reroute op + last-wins on
+- **Slice 4 — Reroute. [DONE]** The `reroute` task + engine reroute op + last-wins on
   the target zone. *Demo:* audio playing to Kitchen; tap in the app → it moves to
   Living Room with the phone still connected to the Kitchen receiver.
+  > **As built — Slice 4:** reroute is **cache invalidation on the pull-driven
+  > pump, not a reader restart** — the pump's per-chunk `sink_for_source` picks up
+  > the rerouted zone's sink (rebuilding the resampler if the format differs).
+  > Sink resolution is **eager** (errors surface in the `reroute` response; a
+  > failure leaves the source on its old zone), and `session_ended` **reverts
+  > `dest_zone` to the home zone** so a reroute does not persist across sessions.
 
 `CLAUDE.md`'s protocol section is updated as slices 2–4 land.
 
