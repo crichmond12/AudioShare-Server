@@ -18,6 +18,9 @@ pub enum Task {
     /// Client asks the hub to (re-)send the current AirPlay source list. Handled in
     /// `Connection::handle_task` (it needs the connection to push), not `dispatch`.
     ListSources,
+    /// Client requests album art bytes for a given `art_id`. Returns inline data
+    /// via `dispatch` (not a push), so no `handle_task` special-case is needed.
+    GetArt,
     CreateZone,
     DeleteZone,
     RenameZone,
@@ -35,6 +38,7 @@ impl Task {
             "volume" => Task::Volume,
             "list_outputs" => Task::ListOutputs,
             "list_sources" => Task::ListSources,
+            "get_art" => Task::GetArt,
             "create_zone" => Task::CreateZone,
             "delete_zone" => Task::DeleteZone,
             "rename_zone" => Task::RenameZone,
@@ -53,6 +57,7 @@ impl Task {
             Task::Volume => "volume",
             Task::ListOutputs => "list_outputs",
             Task::ListSources => "list_sources",
+            Task::GetArt => "get_art",
             Task::CreateZone => "create_zone",
             Task::DeleteZone => "delete_zone",
             Task::RenameZone => "rename_zone",
@@ -139,6 +144,24 @@ pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
                     Ok(()) => TaskResponse::accepted("set_zone_outputs", None),
                     Err(code) => TaskResponse::error("set_zone_outputs", code),
                 }
+            }
+        }
+        Task::GetArt => {
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine as _;
+            match data["art_id"].as_str() {
+                Some(art_id) if !art_id.is_empty() => match ENGINE.get_art(art_id) {
+                    Some((mime, bytes)) => TaskResponse::accepted(
+                        "get_art",
+                        Some(json!({
+                            "art_id": art_id,
+                            "mime": mime,
+                            "image": STANDARD.encode(bytes),
+                        })),
+                    ),
+                    None => TaskResponse::error("get_art", "unknown_art"),
+                },
+                _ => TaskResponse::error("get_art", "unknown_art"),
             }
         }
         Task::Unknown(ref name) => {
@@ -246,5 +269,28 @@ mod tests {
         let json = dispatch(Task::parse("set_zone_outputs"), &data).to_json();
         assert!(json.contains("\"status\":\"error\""));
         assert!(json.contains("\"error\":\"unknown_output\""));
+    }
+
+    #[test]
+    fn parses_get_art_task() {
+        assert_eq!(Task::parse("get_art"), Task::GetArt);
+        assert_eq!(Task::GetArt.name(), "get_art");
+    }
+
+    #[test]
+    fn get_art_unknown_id_errors() {
+        // No art cached -> any id is unknown_art. Device-free.
+        let data = serde_json::json!({ "art_id": "deadbeef" });
+        let json = dispatch(Task::GetArt, &data).to_json();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"unknown_art\""));
+        assert!(json.contains("\"task\":\"get_art\""));
+    }
+
+    #[test]
+    fn get_art_without_id_errors() {
+        let json = dispatch(Task::GetArt, &Value::Null).to_json();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"unknown_art\""));
     }
 }

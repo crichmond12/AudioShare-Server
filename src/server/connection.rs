@@ -210,7 +210,9 @@ impl<'connection> Connection<'connection> {
             .into_iter()
             .map(|s| json!({
                 "source": s.source, "name": s.name, "dest_zone": s.dest_zone,
-                "active": true, "routed": s.routed
+                "active": true, "routed": s.routed,
+                "title": s.title, "artist": s.artist, "album": s.album,
+                "client": s.client, "art_id": s.art_id
             }))
             .collect();
         let response = TaskResponse::accepted("sources", Some(json!({ "sources": sources })));

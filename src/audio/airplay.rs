@@ -57,6 +57,11 @@ pub fn fifo_path(index: usize) -> PathBuf {
     PathBuf::from(format!("{FIFO_PATH_BASE}-{index}.pcm"))
 }
 
+/// Path of the metadata FIFO backing receiver `index` (parallel to [`fifo_path`]).
+pub fn meta_fifo_path(index: usize) -> PathBuf {
+    PathBuf::from(format!("{FIFO_PATH_BASE}-{index}.meta"))
+}
+
 /// Convert interleaved little-endian `s16` `bytes` into `channels` planar `f32`
 /// channels in `[-1.0, 1.0]`. A trailing partial frame (fewer than
 /// `channels * 2` bytes) is ignored — callers carry the remainder.
@@ -75,17 +80,22 @@ pub(crate) fn i16le_to_planar_f32(bytes: &[u8], channels: usize) -> Vec<Vec<f32>
 }
 
 /// Build a minimal libconfig `shairport-sync` config: a named classic-AirPlay
-/// receiver on `port` whose `pipe` backend writes raw PCM to `fifo_path`.
+/// receiver on `port` whose `pipe` backend writes raw PCM to `fifo_path`, plus a
+/// `metadata` backend writing the DAAP/PICT metadata stream to a sibling `.meta`
+/// FIFO (same stem as the audio FIFO).
 fn shairport_config(name: &str, port: u16, device_id: &str, fifo_path: &Path) -> String {
+    let meta_path = fifo_path.with_extension("meta");
     format!(
         "general =\n{{\n  name = \"{name}\";\n  port = {port};\n  airplay_device_id = \"{device_id}\";\n}};\n\n\
-         pipe =\n{{\n  name = \"{}\";\n}};\n",
-        fifo_path.display()
+         pipe =\n{{\n  name = \"{}\";\n}};\n\n\
+         metadata =\n{{\n  enabled = \"yes\";\n  include_cover_art = \"yes\";\n  pipe_name = \"{}\";\n}};\n",
+        fifo_path.display(),
+        meta_path.display(),
     )
 }
 
 /// Create the FIFO at `path` if it does not already exist (mode 0o600).
-fn ensure_fifo(path: &Path) -> Result<(), String> {
+pub(crate) fn ensure_fifo(path: &Path) -> Result<(), String> {
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|e| format!("bad fifo path {}: {e}", path.display()))?;
     if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
@@ -373,6 +383,21 @@ mod tests {
     fn fifo_path_is_indexed() {
         assert_eq!(fifo_path(0), PathBuf::from("/tmp/audioshare-airplay-0.pcm"));
         assert_eq!(fifo_path(3), PathBuf::from("/tmp/audioshare-airplay-3.pcm"));
+    }
+
+    #[test]
+    fn meta_fifo_path_is_indexed() {
+        assert_eq!(meta_fifo_path(0), PathBuf::from("/tmp/audioshare-airplay-0.meta"));
+        assert_eq!(meta_fifo_path(3), PathBuf::from("/tmp/audioshare-airplay-3.meta"));
+    }
+
+    #[test]
+    fn config_enables_metadata_pipe() {
+        let cfg = shairport_config("Kitchen", 5002, "AA5500000002", Path::new("/tmp/x.pcm"));
+        assert!(cfg.contains("metadata ="), "{cfg}");
+        assert!(cfg.contains("enabled = \"yes\""), "{cfg}");
+        assert!(cfg.contains("include_cover_art = \"yes\""), "{cfg}");
+        assert!(cfg.contains("/tmp/x.meta"), "{cfg}"); // meta pipe path derived from audio path
     }
 
     #[test]
