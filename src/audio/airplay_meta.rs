@@ -134,6 +134,12 @@ fn hex_tag(item: &str, tag: &str) -> Option<String> {
     let s = item.find(&open)? + open.len();
     let e = item[s..].find(&close)? + s;
     let hex = &item[s..e];
+    // Guard: odd length would panic on `hex[i..i+2]`; non-ASCII would give a
+    // wrong byte boundary. Either means malformed FIFO input — return None
+    // rather than panicking the metadata reader thread.
+    if hex.len() % 2 != 0 || !hex.is_ascii() {
+        return None;
+    }
     let bytes: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
@@ -363,5 +369,29 @@ mod tests {
 
         let events = got.lock().unwrap();
         assert!(matches!(events.first(), Some(MetaEvent::Title(t)) if t == "Hello"), "{events:?}");
+    }
+
+    // hex_tag must return None for malformed hex rather than panicking the
+    // metadata reader thread.
+    #[test]
+    fn hex_tag_rejects_odd_length_hex() {
+        // Odd-length hex body — would panic on hex[i..i+2] without the guard.
+        let odd = "<item><type>abc</type></item>";
+        assert!(hex_tag(odd, "type").is_none(), "odd-length hex must return None");
+    }
+
+    #[test]
+    fn hex_tag_rejects_non_ascii_hex() {
+        // Non-ASCII byte inside the hex body — would give a wrong byte boundary.
+        let non_ascii = "<item><type>636f72\u{00e9}</type></item>"; // é is multi-byte
+        assert!(hex_tag(non_ascii, "type").is_none(), "non-ASCII hex must return None");
+    }
+
+    #[test]
+    fn hex_tag_happy_path_decodes_correctly() {
+        // "core" in hex is 636f7265 — a valid 8-char ASCII hex string.
+        let item = "<item><type>636f7265</type></item>";
+        let result = hex_tag(item, "type").expect("valid hex must decode");
+        assert_eq!(result, "core");
     }
 }

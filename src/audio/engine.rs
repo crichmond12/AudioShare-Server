@@ -517,8 +517,21 @@ impl Engine {
             s.active = true;
             s.routed = true;
             s.sink = None;
+            // Slice 3: clear stale metadata from the previous session so a
+            // trailing-commit (meta FIFO closes after audio FIFO) cannot leak
+            // into this new session's visible state.
+            s.title.clear();
+            s.artist.clear();
+            s.album.clear();
+            s.client.clear();
+            s.art_id.clear();
             s.dest_zone.clone()
         };
+        // Evict art outside the sources lock — same lock order as session_ended.
+        self.art_cache
+            .lock()
+            .expect("engine art cache mutex poisoned")
+            .remove(source);
 
         // Detach whatever drives dest now, then install this source. Snapshot+release
         // around any blocking shutdown.
@@ -1207,6 +1220,43 @@ mod tests {
         // Source is now inactive (not in list_sources), and its art is evicted.
         assert!(engine.list_sources().is_empty());
         assert!(engine.get_art(&art_id).is_none());
+    }
+
+    // session_began clears any track/art left from the previous session so a
+    // trailing metadata commit (meta FIFO closes after audio FIFO) cannot leak
+    // stale data into the new session's visible state.
+    #[test]
+    fn session_began_clears_stale_track_and_art() {
+        let engine = Engine::new();
+        engine.add_idle_source("default", "Hub");
+
+        // First session: set track + art.
+        engine.session_began("default");
+        engine.track_update("default", "Old Song", "Old Artist", "Old Album", "Old Phone");
+        engine.art_update("default", &[0xFF, 0xD8, 0xFF, 1, 2, 3]); // JPEG
+        let stale_art_id = engine.list_sources()[0].art_id.clone();
+        assert!(!stale_art_id.is_empty());
+
+        // End that session (clears track/art).
+        engine.session_ended("default");
+
+        // Trailing commit arrives after session_ended — simulates the race.
+        engine.track_update("default", "Stale Song", "Stale Artist", "Stale Album", "Phone");
+        engine.art_update("default", &[0x89, b'P', b'N', b'G', 0]); // PNG
+
+        // New session starts — session_began must clear the stale values.
+        engine.session_began("default");
+
+        let views = engine.list_sources();
+        let v = views.iter().find(|v| v.source == "default").expect("source active");
+        assert!(v.title.is_empty(), "title should be empty after session_began");
+        assert!(v.artist.is_empty(), "artist should be empty after session_began");
+        assert!(v.album.is_empty(), "album should be empty after session_began");
+        assert!(v.client.is_empty(), "client should be empty after session_began");
+        assert!(v.art_id.is_empty(), "art_id should be empty after session_began");
+
+        // Art cache must also be evicted so get_art returns None.
+        assert!(engine.get_art(&stale_art_id).is_none(), "stale art must be evicted");
     }
 
     // FanOut forwards writes to every member sink.
