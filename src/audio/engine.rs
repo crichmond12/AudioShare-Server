@@ -553,6 +553,100 @@ impl Engine {
         self.notify_outputs_changed(); // zone "playing" state changed
     }
 
+    /// Reroute a **live** AirPlay `source` to `new_zone`. The phone stays connected
+    /// to the same receiver; only the internal destination changes. Sink resolution
+    /// is eager (so routing errors surface here and a failure leaves the source
+    /// entirely unchanged — atomic), but no reader thread is restarted: the pump
+    /// picks up the newly cached sink on its next per-chunk `sink_for_source`.
+    /// Errors: `unknown_source` (no such source or no active session),
+    /// `unknown_zone`, `zone_has_no_outputs`, `mixed_zone_unsupported`,
+    /// `no_free_stream`.
+    pub fn reroute(&self, source: &str, new_zone: &str) -> Result<(), String> {
+        // 1. Validate the source is known + active; snapshot its current dest.
+        let old_dest = {
+            let sources = self.sources.lock().expect("engine sources mutex poisoned");
+            let s = sources.get(source).ok_or_else(|| "unknown_source".to_string())?;
+            if !s.active {
+                return Err("unknown_source".to_string());
+            }
+            s.dest_zone.clone()
+        };
+
+        // 2. Already there: nothing to do (no pushes, no topology churn).
+        if new_zone == old_dest {
+            return Ok(());
+        }
+
+        // 3. Validate the new zone exists; snapshot its outputs off the sources lock.
+        let outputs = {
+            let zones = self.zones.lock().expect("engine zones mutex poisoned");
+            zones
+                .get(new_zone)
+                .map(|z| z.outputs.clone())
+                .ok_or_else(|| "unknown_zone".to_string())?
+        };
+
+        // 4. Eager sink resolution off the locks. On failure the source is left
+        //    entirely unchanged (still routed to old_dest).
+        let sink = self.zone_sink(new_zone, &outputs)?;
+
+        // 5. Point the source at the new zone and cache the resolved sink FIRST,
+        //    before releasing the old Snapcast slot. The pump's `sink_for_source`
+        //    reads this cached sink, so caching the new one ahead of the old-slot
+        //    release closes the window where a concurrent pump write could land on
+        //    an already-released slot (5a's `detach_driver` may join a slow decode
+        //    thread).
+        {
+            let mut sources = self.sources.lock().expect("engine sources mutex poisoned");
+            if let Some(s) = sources.get_mut(source) {
+                s.dest_zone = new_zone.to_string();
+                s.routed = true;
+                s.sink = Some(Arc::clone(&sink));
+            }
+        }
+
+        // 5a. Detach this source from its old zone — only if it still drives it
+        //     (it may have gone connected-but-unrouted). Free the old Snapcast slot
+        //     only when we actually owned that zone.
+        let cleared_old = {
+            let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+            match zones.get_mut(&old_dest) {
+                Some(z) if matches!(&z.current, Some(ZoneDriver::Airplay(s)) if s == source) => {
+                    z.current = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if cleared_old {
+            self.snapcast.release_zone(&old_dest);
+        }
+
+        // 5b. Detach whatever currently drives the new zone (last-wins): a URL
+        //     pipeline is shut down; another AirPlay source is marked unrouted.
+        let new_prev = {
+            let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+            zones.get_mut(new_zone).and_then(|z| z.current.take())
+        };
+        if let Some(prev) = new_prev {
+            self.detach_driver(prev);
+        }
+
+        // 5c. Install the source as the new zone's driver. The source's cached
+        //     `sink` (set above) is the pump's source of truth for routing; this
+        //     zone-driver install is bookkeeping for last-wins / `session_ended`.
+        {
+            let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
+            if let Some(z) = zones.get_mut(new_zone) {
+                z.current = Some(ZoneDriver::Airplay(source.to_string()));
+            }
+        }
+
+        self.notify_sources_changed();
+        self.notify_outputs_changed();
+        Ok(())
+    }
+
     /// Where should `source` write right now? `None` if it has no active session or
     /// has been detached (unrouted). Resolves and caches the dest_zone's sink on the
     /// first call of a session (lock released around the blocking `zone_sink`).
@@ -597,13 +691,15 @@ impl Engine {
             s.active = false;
             s.routed = false;
             s.sink = None;
+            let dest = s.dest_zone.clone(); // the zone it was actually routed to (maybe rerouted)
+            s.dest_zone = source.to_string(); // revert-to-home: reroute is per-session
             // Slice 3: now-playing is session-scoped.
             s.title.clear();
             s.artist.clear();
             s.album.clear();
             s.client.clear();
             s.art_id.clear();
-            s.dest_zone.clone()
+            dest
         };
 
         let mut zones = self.zones.lock().expect("engine zones mutex poisoned");
@@ -792,6 +888,26 @@ impl Engine {
         };
         if let Some(prev) = prev {
             self.detach_driver(prev);
+        }
+    }
+
+    // The two helpers below fake an inconsistent intermediate reroute state on
+    // purpose: real `reroute` clears the old zone's driver in step 5a, but these
+    // mutate dest/driver directly without that clear. That's fine for what the
+    // tests assert (revert-to-home and rerouted-zone-driver cleanup on session end).
+    #[cfg(test)]
+    fn force_dest_zone(&self, source: &str, zone: &str) {
+        let mut sources = self.sources.lock().unwrap();
+        if let Some(s) = sources.get_mut(source) {
+            s.dest_zone = zone.to_string();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_airplay_driver_for_test(&self, zone: &str, source: &str) {
+        let mut zones = self.zones.lock().unwrap();
+        if let Some(z) = zones.get_mut(zone) {
+            z.current = Some(ZoneDriver::Airplay(source.to_string()));
         }
     }
 }
@@ -1257,6 +1373,98 @@ mod tests {
 
         // Art cache must also be evicted so get_art returns None.
         assert!(engine.get_art(&stale_art_id).is_none(), "stale art must be evicted");
+    }
+
+    #[test]
+    fn reroute_unknown_source_errors() {
+        let engine = Engine::new();
+        // No source registered at all.
+        assert_eq!(engine.reroute("ghost", "default").unwrap_err(), "unknown_source");
+        // A known but inactive source is also "unknown_source" (nothing to move).
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_idle_source("d1", "Kitchen");
+        assert_eq!(engine.reroute("d1", "default").unwrap_err(), "unknown_source");
+    }
+
+    #[test]
+    fn reroute_unknown_zone_leaves_source_in_place() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_idle_source("d1", "Kitchen");
+        engine.session_began("d1"); // active, dest == "d1" (lazy: no sink resolved)
+
+        assert_eq!(engine.reroute("d1", "nope").unwrap_err(), "unknown_zone");
+
+        // Atomic failure: still active, still on its home zone, still driving it.
+        let s = &engine.list_sources()[0];
+        assert_eq!(s.dest_zone, "d1");
+        assert!(s.routed);
+        assert!(engine.zone_has_airplay_driver("d1"));
+    }
+
+    #[test]
+    fn reroute_to_zone_with_no_online_outputs_errors_and_is_atomic() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_idle_source("d1", "Kitchen");
+        engine.session_began("d1");
+
+        // d2's auto-zone has only an offline dongle -> zone_has_no_outputs on resolve.
+        engine.add_dongle_output("d2", "Bedroom");
+        engine.dongle_offline("d2");
+
+        assert_eq!(engine.reroute("d1", "d2").unwrap_err(), "zone_has_no_outputs");
+
+        // Eager-resolution failure left the source untouched on its old zone.
+        let s = &engine.list_sources()[0];
+        assert_eq!(s.dest_zone, "d1");
+        assert!(s.routed);
+        assert!(engine.zone_has_airplay_driver("d1"));
+        assert!(!engine.zone_has_airplay_driver("d2"));
+    }
+
+    #[test]
+    fn reroute_to_same_zone_is_noop_ok() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_idle_source("d1", "Kitchen");
+        engine.session_began("d1");
+
+        engine.reroute("d1", "d1").expect("same-zone reroute is a no-op Ok");
+
+        let s = &engine.list_sources()[0];
+        assert_eq!(s.dest_zone, "d1");
+        assert!(s.routed);
+    }
+
+    #[test]
+    fn session_ended_clears_rerouted_zone_driver() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_dongle_output("d2", "Office");
+        engine.add_idle_source("d1", "Kitchen");
+        engine.session_began("d1"); // driver Airplay("d1") on zone d1, dest == d1
+        // Simulate a reroute to d2 device-free: move dest + install the driver on d2.
+        engine.force_dest_zone("d1", "d2");
+        engine.set_airplay_driver_for_test("d2", "d1");
+        engine.session_ended("d1");
+        assert!(!engine.zone_has_airplay_driver("d2"), "rerouted zone driver cleared on session end");
+    }
+
+    #[test]
+    fn session_ended_reverts_rerouted_dest_to_home() {
+        let engine = Engine::new();
+        engine.add_dongle_output("d1", "Kitchen");
+        engine.add_idle_source("d1", "Kitchen");
+        engine.session_began("d1");
+
+        // Simulate a prior reroute having moved the destination off the home zone.
+        engine.force_dest_zone("d1", "somewhere-else");
+        engine.session_ended("d1");
+
+        // A fresh session reads dest_zone; revert-to-home means it routes home again.
+        engine.session_began("d1");
+        assert_eq!(engine.list_sources()[0].dest_zone, "d1");
     }
 
     // FanOut forwards writes to every member sink.

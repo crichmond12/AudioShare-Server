@@ -21,6 +21,7 @@ pub enum Task {
     /// Client requests album art bytes for a given `art_id`. Returns inline data
     /// via `dispatch` (not a push), so no `handle_task` special-case is needed.
     GetArt,
+    Reroute,
     CreateZone,
     DeleteZone,
     RenameZone,
@@ -39,6 +40,7 @@ impl Task {
             "list_outputs" => Task::ListOutputs,
             "list_sources" => Task::ListSources,
             "get_art" => Task::GetArt,
+            "reroute" => Task::Reroute,
             "create_zone" => Task::CreateZone,
             "delete_zone" => Task::DeleteZone,
             "rename_zone" => Task::RenameZone,
@@ -58,6 +60,7 @@ impl Task {
             Task::ListOutputs => "list_outputs",
             Task::ListSources => "list_sources",
             Task::GetArt => "get_art",
+            Task::Reroute => "reroute",
             Task::CreateZone => "create_zone",
             Task::DeleteZone => "delete_zone",
             Task::RenameZone => "rename_zone",
@@ -162,6 +165,24 @@ pub fn dispatch(task: Task, data: &Value) -> TaskResponse {
                     None => TaskResponse::error("get_art", "unknown_art"),
                 },
                 _ => TaskResponse::error("get_art", "unknown_art"),
+            }
+        }
+        Task::Reroute => {
+            let source = data["source"].as_str().filter(|s| !s.is_empty());
+            let zone = data["zone"].as_str().filter(|z| !z.is_empty());
+            match (source, zone) {
+                (None, _) => TaskResponse::error("reroute", "missing_source"),
+                (Some(_), None) => TaskResponse::error("reroute", "missing_zone"),
+                (Some(source), Some(zone)) => match ENGINE.reroute(source, zone) {
+                    Ok(()) => {
+                        println!("Rerouted source {} -> zone {}", source, zone);
+                        TaskResponse::accepted("reroute", None)
+                    }
+                    Err(code) => {
+                        println!("Reroute {} -> {} failed: {}", source, zone, code);
+                        TaskResponse::error("reroute", code)
+                    }
+                },
             }
         }
         Task::Unknown(ref name) => {
@@ -292,5 +313,26 @@ mod tests {
         let json = dispatch(Task::GetArt, &Value::Null).to_json();
         assert!(json.contains("\"status\":\"error\""));
         assert!(json.contains("\"error\":\"unknown_art\""));
+    }
+
+    #[test]
+    fn parses_reroute_task() {
+        assert_eq!(Task::parse("reroute"), Task::Reroute);
+    }
+
+    #[test]
+    fn reroute_without_source_errors_missing_source() {
+        let json = dispatch(Task::Reroute, &json!({ "zone": "office" })).to_json();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"missing_source\""));
+        assert!(json.contains("\"task\":\"reroute\""));
+    }
+
+    #[test]
+    fn reroute_without_zone_errors_missing_zone() {
+        let json = dispatch(Task::Reroute, &json!({ "source": "kitchen" })).to_json();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"missing_zone\""));
+        assert!(json.contains("\"task\":\"reroute\""));
     }
 }
